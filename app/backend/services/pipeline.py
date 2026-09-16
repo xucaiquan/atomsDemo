@@ -27,7 +27,7 @@ from models.projects import Projects
 from models.versions import Versions
 from schemas.aihub import ChatMessage, GenTxtRequest
 from services.aihub import AIHubService
-from services.html_extract import sanitize_generated_html
+from services.html_extract import extract_html, inject_csp, is_complete_document
 from services import prompts
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,13 @@ logger = logging.getLogger(__name__)
 # 阶段模型选型：前两阶段输出短、要求快；代码生成阶段追求质量并避免 HTML 截断。
 FAST_MODEL = "deepseek-v4-flash"
 CODE_MODEL = "deepseek-v4-pro"
+
+# 代码生成阶段的输出预算。推理模型的思考链会占用输出，放宽以降低截断概率。
+CODE_MAX_TOKENS = 16384
+# 续写时回传给模型的中断位置上下文长度（字符）。
+CONTINUE_TAIL_CHARS = 2000
+# 续写产出若以完整文档开头，视为模型重开了整篇文档，直接采用新产出。
+_DOC_RESTART_PATTERN = re.compile(r"<!DOCTYPE\s+html|<html[\s>]", re.IGNORECASE)
 
 ACTIVE_STATUSES = ("pending", "running")
 FALLBACK_TITLE = "未命名项目"
@@ -102,6 +109,22 @@ def _fallback_title(prompt: str) -> str:
     """标题缺失时回退为用户描述的前 20 字（对应 data-model.md 的回退逻辑）。"""
     cleaned = " ".join(prompt.split())
     return (cleaned[:20] or FALLBACK_TITLE)[:120]
+
+
+def _merge_continuation(existing: str, continuation: str) -> str:
+    """把续写片段拼接到已产出文档末尾，去掉模型重复输出的重叠部分。
+
+    模型续写时偶尔会复述中断点前的少量文字，直接拼接会产生重复片段。
+    这里在 existing 末尾 300 字符窗口内寻找与 continuation 开头的最大重叠。
+    """
+    continuation = continuation.strip()
+    if not continuation:
+        return existing
+    tail = existing[-min(len(existing), 300):]
+    for size in range(min(len(tail), len(continuation)), 0, -1):
+        if tail.endswith(continuation[:size]):
+            return existing + continuation[size:]
+    return f"{existing}\n{continuation}"
 
 
 class PipelineError(Exception):
@@ -230,31 +253,16 @@ class GenerationPipeline:
             )
 
             # ---------- 阶段 3 代码生成 ----------
-            # 完整自包含 HTML 体积大，且 deepseek-v4-pro 为推理模型（思考链会占用
-            # 输出预算），必须显式放宽 max_tokens，否则极易返回空内容。
-            # 截断重试一次：偶发输出被 max_tokens 截断导致缺少 </html>，
-            # 重跑一次模型往往能收敛到更紧凑的完整页面。
-            code_raw = ""
-            html = ""
-            extract_error: str | None = None
-            for attempt in range(2):
-                code_raw = await self._call_step(
-                    project_public_id,
-                    version_seq,
-                    step_seq=3,
-                    model=CODE_MODEL,
-                    system=prompts.CODE_SYSTEM,
-                    user=prompts.build_code_user(prompt, analysis_raw, design_raw, previous_html),
-                    max_tokens=16384,
-                )
-                html, extract_error = sanitize_generated_html(code_raw)
-                if not extract_error:
-                    break
-                logger.warning(
-                    "代码生成第 %s 次产出未通过完整性校验: %s", attempt + 1, extract_error
-                )
-            if extract_error:
-                raise PipelineError(extract_error, 3)
+            # 完整自包含 HTML 体积大且推理模型思考链占用输出预算，内容密集型
+            # 需求极易截断，交由 _generate_code 做「截断续写 + 整篇重跑」兜底。
+            html = await self._generate_code(
+                project_public_id,
+                version_seq,
+                prompt,
+                analysis_raw,
+                design_raw,
+                previous_html,
+            )
 
             code_summary = f"产出可运行页面，约 {len(html) // 1024 or 1} KB"
             await self._finish_step(project_public_id, version_seq, 3, html, code_summary)
@@ -322,6 +330,74 @@ class GenerationPipeline:
 
     # ------------------------------------------------------------------ 内部工具
 
+    async def _generate_code(
+        self,
+        project_public_id: str,
+        version_seq: int,
+        prompt: str,
+        analysis_raw: str,
+        design_raw: str,
+        previous_html: str | None,
+    ) -> str:
+        """阶段 3 代码生成：截断续写 + 整篇重跑兜底。
+
+        内容密集型需求（如「每日菜谱推荐」需要大量菜品数据）极易被
+        max_tokens 截断。恢复策略优先「续写」：把已产出内容的末尾片段
+        回传给模型，让它从中断处接着写，拼接后校验，最多两轮；
+        仍不完整则整篇重跑一次（模型可能产出更紧凑的完整页面）；
+        最终仍失败才抛出可读错误。
+        """
+        user = prompts.build_code_user(prompt, analysis_raw, design_raw, previous_html)
+        for attempt in range(2):
+            code_raw = await self._call_step(
+                project_public_id,
+                version_seq,
+                step_seq=3,
+                model=CODE_MODEL,
+                system=prompts.CODE_SYSTEM,
+                user=user,
+                max_tokens=CODE_MAX_TOKENS,
+            )
+            doc = extract_html(code_raw)
+            for round_no in range(2):
+                lowered = doc.lower()
+                if "<html" not in lowered and "<body" not in lowered:
+                    break  # 不是有效页面，直接进入整篇重跑
+                if is_complete_document(doc):
+                    return inject_csp(doc)
+                logger.warning(
+                    "代码生成第 %s 轮产出截断（长度 %s），尝试续写第 %s 次",
+                    attempt + 1,
+                    len(doc),
+                    round_no + 1,
+                )
+                cont_raw = await self._call_step(
+                    project_public_id,
+                    version_seq,
+                    step_seq=3,
+                    model=CODE_MODEL,
+                    system=prompts.CODE_SYSTEM,
+                    user=prompts.build_code_continue_user(doc[-CONTINUE_TAIL_CHARS:]),
+                    max_tokens=CODE_MAX_TOKENS,
+                    history=[
+                        ChatMessage(role="user", content=user),
+                        ChatMessage(role="assistant", content=doc),
+                    ],
+                )
+                cont = extract_html(cont_raw)
+                if not cont:
+                    break
+                if _DOC_RESTART_PATTERN.match(cont):
+                    doc = cont  # 模型重开了整篇文档，直接采用新产出
+                else:
+                    doc = _merge_continuation(doc, cont)
+            if is_complete_document(doc):
+                return inject_csp(doc)
+            logger.warning("代码生成第 %s 轮续写后仍不完整", attempt + 1)
+        raise PipelineError(
+            "生成的页面内容不完整（可能被截断），请简化需求后重试", 3
+        )
+
     async def _call_step(
         self,
         project_public_id: str,
@@ -331,6 +407,7 @@ class GenerationPipeline:
         system: str,
         user: str,
         max_tokens: int = 4096,
+        history: list[ChatMessage] | None = None,
     ) -> str:
         """把步骤置 running 后调用模型（非流式，便于完整校验产出）。
 
@@ -346,6 +423,7 @@ class GenerationPipeline:
         request = GenTxtRequest(
             messages=[
                 ChatMessage(role="system", content=system),
+                *(history or []),
                 ChatMessage(role="user", content=user),
             ],
             model=model,
