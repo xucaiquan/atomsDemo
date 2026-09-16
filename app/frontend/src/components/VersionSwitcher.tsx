@@ -31,6 +31,7 @@ export default function VersionSwitcher({ versions, activeSeq, onSelect }: Versi
         >
           v{version.seq}
           {version.status === 'failed' && <span className="ml-1 text-rose-400">✕</span>}
+          {version.status === 'cancelled' && <span className="ml-1 text-amber-400">⊘</span>}
         </button>
       ))}
     </div>

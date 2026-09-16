@@ -8,7 +8,8 @@
 - ``GET    /api/v1/atoms/projects/{public_id}``            项目详情（含版本与对话，不含 html）
 - ``GET    /api/v1/atoms/projects/{public_id}/versions/{seq}``  单版本完整内容（含 html）
 - ``DELETE /api/v1/atoms/projects/{public_id}``            删除项目（级联）
-- ``POST   /api/v1/atoms/projects/{public_id}/generate``   三阶段生成
+- ``POST   /api/v1/atoms/projects/{public_id}/generate``   三阶段生成（异步受理 202）
+- ``POST   /api/v1/atoms/projects/{public_id}/versions/{seq}/cancel``  取消进行中的生成
 
 契约要点：
 1. 对外一律使用 ``public_id``（UUID v4），**自增 id 不出现在任何响应中**。
@@ -358,7 +359,10 @@ async def delete_project(public_id: str, db: AsyncSession = Depends(get_db)):
 # 任何结果。因此生成改为：请求内只做校验 + 落库（毫秒级）→ 立即返回 202 受理 →
 # 三阶段在 asyncio 后台任务中用独立会话执行 → 前端轮询 steps 接口取终态。
 
-_RUNNING_TASKS: set[asyncio.Task] = set()
+# 任务注册表：(project_public_id, version_seq) -> asyncio.Task。
+# 取消接口据此对进程内仍在执行的后台任务调用 task.cancel()，
+# 让正在等待模型响应的 await 点立即中断，而不必等到下一阶段边界。
+_RUNNING_TASKS: dict[tuple[str, int], asyncio.Task] = {}
 
 
 async def _run_generation_in_background(
@@ -366,18 +370,40 @@ async def _run_generation_in_background(
     version_seq: int,
     prompt: str,
     previous_html: str | None,
+    history_prompts: list[str] | None = None,
 ) -> None:
     """后台执行三阶段流水线，使用独立 DB 会话（请求会话此时已关闭）。"""
     try:
         async with db_manager.session() as session:
             pipeline = GenerationPipeline(session)
-            outcome = await pipeline.run(public_id, version_seq, prompt, previous_html)
+            outcome = await pipeline.run(
+                public_id, version_seq, prompt, previous_html, history_prompts
+            )
             logger.info(
                 "后台生成结束 project=%s seq=%s status=%s",
                 public_id[:8],
                 version_seq,
                 outcome.get("status"),
             )
+    except asyncio.CancelledError:
+        # 取消接口已把版本与活跃步骤落库为 cancelled；这里只做兜底，
+        # 把任务被硬中断时残留的活跃步骤收尾，避免前端看到永久 running。
+        logger.info("后台生成任务被取消 project=%s seq=%s", public_id[:8], version_seq)
+        try:
+            async with db_manager.session() as session:
+                steps_result = await session.execute(
+                    select(Generation_steps).where(
+                        Generation_steps.project_public_id == public_id,
+                        Generation_steps.version_seq == version_seq,
+                        Generation_steps.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                for step in steps_result.scalars().all():
+                    step.status = "cancelled"
+                    step.output = step.output or "已取消"
+                await session.commit()
+        except Exception as inner:  # noqa: BLE001
+            logger.exception("取消收尾落库失败: %s", inner)
     except Exception as exc:  # noqa: BLE001 - 后台任务异常不得冒泡
         logger.exception("后台生成任务异常: %s", exc)
         try:
@@ -414,14 +440,21 @@ async def _run_generation_in_background(
 
 
 def _spawn_generation(
-    public_id: str, version_seq: int, prompt: str, previous_html: str | None
+    public_id: str,
+    version_seq: int,
+    prompt: str,
+    previous_html: str | None,
+    history_prompts: list[str] | None,
 ) -> None:
-    """创建受跟踪的后台任务，防止 task 被 GC 提前回收。"""
+    """创建受跟踪的后台任务，注册到任务表以支持取消，并防止 task 被 GC 提前回收。"""
+    key = (public_id, version_seq)
     task = asyncio.create_task(
-        _run_generation_in_background(public_id, version_seq, prompt, previous_html)
+        _run_generation_in_background(
+            public_id, version_seq, prompt, previous_html, history_prompts
+        )
     )
-    _RUNNING_TASKS.add(task)
-    task.add_done_callback(_RUNNING_TASKS.discard)
+    _RUNNING_TASKS[key] = task
+    task.add_done_callback(lambda _t, k=key: _RUNNING_TASKS.pop(k, None))
 
 
 @router.post("/projects/{public_id}/generate", status_code=202)
@@ -460,7 +493,7 @@ async def generate(
     if active.scalars().first():
         return error_envelope("CONFLICT", "该项目已有正在进行的生成，请等待完成后再试")
 
-    # 迭代时只回传上一版 HTML（research.md R5）
+    # 迭代时回传上一版 HTML（research.md R5）
     previous_result = await db.execute(
         select(Versions)
         .where(
@@ -473,13 +506,26 @@ async def generate(
     previous = previous_result.scalars().first()
     previous_html = previous.html if previous else None
 
+    # 需求历史：本项目此前所有版本的原始需求（时间升序）。用于让模型消解
+    # 「继续刚刚的需求」「按之前说的」「再优化一下」这类指代——否则模型只
+    # 看到孤立的当前短句，无法还原真实意图。条数与长度由 prompts 层截断，
+    # 上下文不会随轮次线性膨胀。必须在 prepare 落库新版本之前查询。
+    history_result = await db.execute(
+        select(Versions.prompt)
+        .where(Versions.project_public_id == public_id)
+        .order_by(Versions.seq)
+    )
+    history_prompts = [row for row in history_result.scalars().all() if row]
+
     pipeline = GenerationPipeline(db)
     prepared = await pipeline.prepare(project, prompt)
     version_seq = prepared["version_seq"]
 
     # 请求会话到此结束；三阶段在后台任务里用独立会话执行，
     # 本接口毫秒级返回，彻底避开网关 120s 代理读超时。
-    _spawn_generation(public_id, version_seq, prompt, previous_html)
+    _spawn_generation(
+        public_id, version_seq, prompt, previous_html, history_prompts
+    )
 
     return {
         "status": "accepted",
@@ -530,3 +576,66 @@ async def get_version_steps(
     }
     await db.commit()
     return payload
+
+
+@router.post("/projects/{public_id}/versions/{seq}/cancel")
+async def cancel_generation(
+    public_id: str, seq: int, db: AsyncSession = Depends(get_db)
+):
+    """取消进行中的生成（中断任务能力）。
+
+    - 版本处于 ``pending`` / ``running``：立即落库为 ``cancelled``（含活跃步骤
+      与项目状态），并对进程内后台任务调用 ``task.cancel()``——正在等待模型
+      响应的 await 点会被注入 ``CancelledError`` 即时中断；若任务已越过 await
+      点，流水线也会在下一阶段边界检测到 cancelled 状态后停止。
+    - 版本已是终态：返回 409，避免误取消已完成的结果。
+    - 已成功的旧版本不受影响；用户输入的需求已持久化，可继续提交新要求。
+    """
+    version_result = await db.execute(
+        select(Versions).where(
+            Versions.project_public_id == public_id, Versions.seq == seq
+        )
+    )
+    version = version_result.scalars().first()
+    if not version:
+        return error_envelope("NOT_FOUND", "该版本不存在")
+    if version.status not in ACTIVE_STATUSES:
+        return error_envelope("CONFLICT", "该版本已结束，无需取消")
+
+    version.status = "cancelled"
+    version.error = "生成已取消"
+
+    steps_result = await db.execute(
+        select(Generation_steps).where(
+            Generation_steps.project_public_id == public_id,
+            Generation_steps.version_seq == seq,
+        )
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for step in steps_result.scalars().all():
+        if step.status in ACTIVE_STATUSES:
+            step.status = "cancelled"
+            step.output = step.output or "已取消"
+            step.ended_at = step.ended_at or now_iso
+
+    project = await _fetch_project(db, public_id)
+    if project and project.latest_status in ACTIVE_STATUSES:
+        project.latest_status = "cancelled"
+
+    db.add(
+        Messages(
+            project_public_id=public_id,
+            role="assistant",
+            content="已停止本次生成，之前的版本不受影响；你可以继续提交新的要求。",
+            version_seq=seq,
+        )
+    )
+    await db.commit()
+
+    # 状态先落库再中断任务：即使 task.cancel() 的时机错过 await 点，
+    # 流水线阶段边界检查也会阻止后续模型调用，结果不会覆盖取消状态。
+    task = _RUNNING_TASKS.get((public_id, seq))
+    if task and not task.done():
+        task.cancel()
+
+    return {"status": "cancelled", "version_seq": seq}

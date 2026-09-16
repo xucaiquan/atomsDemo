@@ -2,9 +2,10 @@
  * PromptInput —— 描述输入与提交（US1 / T022）。
  *
  * - 生成中禁用重复提交（配合后端 409 并发约束）
+ * - 生成中提供「停止生成」，调用后端取消接口中断后台任务
  * - 失败时不清空输入（FR-011 / SC-007：用户已输入内容保留率 100%）
  */
-import { Loader2, Send, Sparkles } from 'lucide-react';
+import { Loader2, Send, Sparkles, Square } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { PROMPT_MAX_LEN_HINT } from '@/lib/constants';
@@ -13,6 +14,7 @@ interface PromptInputProps {
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  onStop?: () => void;
   isGenerating: boolean;
   hasProject: boolean;
 }
@@ -27,6 +29,7 @@ export default function PromptInput({
   value,
   onChange,
   onSubmit,
+  onStop,
   isGenerating,
   hasProject,
 }: PromptInputProps) {
@@ -72,23 +75,35 @@ export default function PromptInput({
         </div>
       )}
 
-      <Button
-        onClick={onSubmit}
-        disabled={!canSubmit}
-        className="w-full gap-2 bg-gradient-to-r from-sky-500 to-indigo-500 text-white hover:from-sky-400 hover:to-indigo-400 disabled:opacity-40"
-      >
-        {isGenerating ? (
-          <>
-            <Loader2 className="h-4 w-4 animate-spin" />
-            智能体工作中…
-          </>
-        ) : (
-          <>
-            {hasProject ? <Sparkles className="h-4 w-4" /> : <Send className="h-4 w-4" />}
-            {hasProject ? '生成新版本' : '生成应用'}
-          </>
+      <div className="flex gap-2">
+        <Button
+          onClick={onSubmit}
+          disabled={!canSubmit}
+          className="flex-1 gap-2 bg-gradient-to-r from-sky-500 to-indigo-500 text-white hover:from-sky-400 hover:to-indigo-400 disabled:opacity-40"
+        >
+          {isGenerating ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              智能体工作中…
+            </>
+          ) : (
+            <>
+              {hasProject ? <Sparkles className="h-4 w-4" /> : <Send className="h-4 w-4" />}
+              {hasProject ? '生成新版本' : '生成应用'}
+            </>
+          )}
+        </Button>
+        {isGenerating && onStop && (
+          <Button
+            variant="outline"
+            onClick={onStop}
+            className="shrink-0 gap-1.5 rounded-xl border-rose-500/40 bg-transparent text-rose-300 hover:bg-rose-500/10 hover:text-rose-200"
+          >
+            <Square className="h-3.5 w-3.5" />
+            停止生成
+          </Button>
         )}
-      </Button>
+      </div>
     </div>
   );
 }

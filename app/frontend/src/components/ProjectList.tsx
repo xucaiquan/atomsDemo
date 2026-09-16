@@ -22,6 +22,7 @@ const STATUS_DOT: Record<string, string> = {
   running: 'bg-sky-400 animate-pulse',
   pending: 'bg-amber-400 animate-pulse',
   failed: 'bg-rose-400',
+  cancelled: 'bg-amber-400',
 };
 
 export default function ProjectList({
@@ -112,7 +113,9 @@ export default function ProjectList({
                     ? '已生成'
                     : project.latest_status === 'failed'
                       ? '上次失败'
-                      : '生成中'}
+                      : project.latest_status === 'cancelled'
+                        ? '已取消'
+                        : '生成中'}
                 </span>
               )}
               <span>v{project.version_count}</span>

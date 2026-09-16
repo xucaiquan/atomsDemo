@@ -137,6 +137,8 @@ export default function Index() {
   // 后端 generate 毫秒级返回 202 受理，三阶段在 asyncio 后台任务中执行；
   // 前端只轮询轻量的 steps 接口观察真实进度，直到 succeeded / failed。
   const pollTimerRef = useRef<number | null>(null);
+  // 当前正在生成的版本号，供「停止生成」调用取消接口时使用
+  const generatingSeqRef = useRef<number | null>(null);
 
   const stopPolling = useCallback(() => {
     if (pollTimerRef.current) {
@@ -158,7 +160,12 @@ export default function Index() {
           } catch {
             /* steps 尚未落库或网络抖动，忽略并继续轮询 */
           }
-          if (snapshot && (snapshot.status === 'succeeded' || snapshot.status === 'failed')) {
+          if (
+            snapshot &&
+            (snapshot.status === 'succeeded' ||
+              snapshot.status === 'failed' ||
+              snapshot.status === 'cancelled')
+          ) {
             pollTimerRef.current = null;
             resolve(snapshot);
             return;
@@ -192,6 +199,11 @@ export default function Index() {
       } catch {
         setFailedMessage('生成结果加载失败，可切换版本重试');
       }
+    } else if (snapshot.status === 'cancelled') {
+      // 用户主动停止：不算失败，展示取消态步骤，旧版本保持可用
+      setFailedMessage(null);
+      if (snapshot.steps.length) setSteps(snapshot.steps);
+      toast.info('已停止本次生成，之前的版本不受影响');
     } else {
       setFailedMessage(snapshot.error || '生成失败，你的描述已保留');
       toast.error(snapshot.error || '生成失败，你的描述已保留');
@@ -233,12 +245,14 @@ export default function Index() {
       //    旧实现同步等待三阶段（3 次模型调用，1~4 分钟），超过网关 120s
       //    代理读超时被掐断 —— 这正是贪吃蛇生成失败的根因。
       const accepted = await atomsApi.generate(publicId, text);
+      generatingSeqRef.current = accepted.version_seq;
       setPrompt('');
       if (accepted.steps?.length) setSteps(accepted.steps);
 
-      // ④ 轮询后台任务直到终态，再取 HTML 渲染
+      // ④ 轮询后台任务直到终态（含 cancelled），再取 HTML 渲染
       const snapshot = await awaitGeneration(publicId, accepted.version_seq);
       setIsGenerating(false);
+      generatingSeqRef.current = null;
       await finishGeneration(publicId, snapshot);
     } catch (e) {
       stopPolling();
@@ -271,17 +285,33 @@ export default function Index() {
     const key = `${detail.public_id}:${activeVersion.seq}`;
     if (resumedRef.current === key) return;
     resumedRef.current = key;
+    generatingSeqRef.current = activeVersion.seq;
     setIsGenerating(true);
     setSteps(activeVersion.steps?.length ? activeVersion.steps : buildLocalSteps());
     void (async () => {
       const snapshot = await awaitGeneration(detail.public_id, activeVersion.seq);
       setIsGenerating(false);
+      generatingSeqRef.current = null;
       await finishGeneration(detail.public_id, snapshot);
     })();
   }, [detail, isGenerating, awaitGeneration, finishGeneration]);
 
   // 组件卸载时清理轮询定时器
   useEffect(() => stopPolling, [stopPolling]);
+
+  // ---------------- 停止生成（任务中断能力） ----------------
+  // 调用后端取消接口：版本与活跃步骤立即落库为 cancelled，进程内后台任务被
+  // task.cancel() 即时中断；进行中的轮询检测到 cancelled 终态后自然收尾。
+  const handleStop = useCallback(async () => {
+    const seq = generatingSeqRef.current;
+    if (!activeId || seq == null) return;
+    try {
+      await atomsApi.cancelGeneration(activeId, seq);
+    } catch (e) {
+      // 版本可能恰好已完成：轮询会以真实终态收尾，这里仅提示
+      toast.error((e as Error).message || '停止失败');
+    }
+  }, [activeId]);
 
   // ---------------- 新建项目 ----------------
   const handleNewProject = useCallback(() => {
@@ -416,6 +446,7 @@ export default function Index() {
               value={prompt}
               onChange={setPrompt}
               onSubmit={() => void handleSubmit()}
+              onStop={() => void handleStop()}
               isGenerating={isGenerating}
               hasProject={!!activeId && hasExistingApp}
             />

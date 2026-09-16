@@ -9,11 +9,11 @@ import { createClient } from '@metagptx/web-sdk';
 
 const client = createClient();
 
-/** 生成步骤的四态。 */
-export type StepStatus = 'pending' | 'running' | 'succeeded' | 'failed';
+/** 生成步骤的五态（cancelled：用户主动停止生成）。 */
+export type StepStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
-/** 版本状态，与 data-model.md 的状态机一致。 */
-export type VersionStatus = 'pending' | 'running' | 'succeeded' | 'failed';
+/** 版本状态，与 data-model.md 的状态机一致（cancelled 为用户取消终态）。 */
+export type VersionStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
 export interface GenerationStep {
   seq: number;
@@ -207,6 +207,22 @@ export const atomsApi = {
       `/api/v1/atoms/projects/${publicId}/generate`,
       'POST',
       { prompt },
+    );
+  },
+
+  /**
+   * 取消进行中的生成（中断任务能力）。
+   *
+   * 后端立即把版本与活跃步骤落库为 cancelled 并中断进程内后台任务；
+   * 已成功的旧版本不受影响，用户输入的需求保留可继续提交新要求。
+   */
+  cancelGeneration(
+    publicId: string,
+    seq: number,
+  ): Promise<{ status: string; version_seq: number }> {
+    return invoke(
+      `/api/v1/atoms/projects/${publicId}/versions/${seq}/cancel`,
+      'POST',
     );
   },
 };

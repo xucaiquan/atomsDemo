@@ -136,6 +136,14 @@ class PipelineError(Exception):
         self.step_seq = step_seq
 
 
+class GenerationCancelled(Exception):
+    """用户在阶段边界取消生成（版本已被取消接口置为 cancelled）。"""
+
+    def __init__(self, step_seq: int) -> None:
+        super().__init__("生成已取消")
+        self.step_seq = step_seq
+
+
 class GenerationPipeline:
     """三阶段生成流水线。
 
@@ -211,14 +219,27 @@ class GenerationPipeline:
         version_seq: int,
         prompt: str,
         previous_html: str | None,
+        history_prompts: list[str] | None = None,
     ) -> dict[str, Any]:
         """执行三阶段流水线并把结果落库。
+
+        ``history_prompts`` 是本项目此前各版本的需求列表（时间升序），
+        用于让模型消解「继续刚刚的需求」「按之前说的」这类指代。
 
         Returns:
             成功：``{"status": "succeeded", "html": ..., "duration_ms": ..., "title": ..., "steps": [...]}``
             失败：``{"status": "failed", "message": ..., "failed_seq": ..., "steps": [...]}``
         """
         started = _now()
+        # 受理与启动之间用户可能已点「停止生成」：版本被置为 cancelled 时不再启动。
+        current = await self._get_version(project_public_id, version_seq)
+        if current and current.status == "cancelled":
+            await self._finalize_cancelled(project_public_id, version_seq)
+            return {
+                "status": "cancelled",
+                "message": "生成已取消",
+                "steps": await self.load_steps(project_public_id, version_seq),
+            }
         await self._set_version_status(project_public_id, version_seq, "running")
 
         try:
@@ -229,7 +250,7 @@ class GenerationPipeline:
                 step_seq=1,
                 model=FAST_MODEL,
                 system=prompts.ANALYZE_SYSTEM,
-                user=prompts.build_analyze_user(prompt, previous_html),
+                user=prompts.build_analyze_user(prompt, previous_html, history_prompts),
             )
             analysis_payload = _parse_json_payload(analysis_raw)
             app_name, analysis_summary = _summarize_analysis(analysis_payload, analysis_raw)
@@ -244,7 +265,9 @@ class GenerationPipeline:
                 step_seq=2,
                 model=FAST_MODEL,
                 system=prompts.DESIGN_SYSTEM,
-                user=prompts.build_design_user(prompt, analysis_raw, previous_html),
+                user=prompts.build_design_user(
+                    prompt, analysis_raw, previous_html, history_prompts
+                ),
             )
             design_payload = _parse_json_payload(design_raw)
             design_summary = _summarize_design(design_payload, design_raw)
@@ -262,11 +285,19 @@ class GenerationPipeline:
                 analysis_raw,
                 design_raw,
                 previous_html,
+                history_prompts,
             )
 
             code_summary = f"产出可运行页面，约 {len(html) // 1024 or 1} KB"
             await self._finish_step(project_public_id, version_seq, 3, html, code_summary)
 
+        except GenerationCancelled:
+            await self._finalize_cancelled(project_public_id, version_seq)
+            return {
+                "status": "cancelled",
+                "message": "生成已取消",
+                "steps": await self.load_steps(project_public_id, version_seq),
+            }
         except PipelineError as exc:
             await self._fail(project_public_id, version_seq, exc.step_seq, exc.message)
             return {
@@ -295,6 +326,13 @@ class GenerationPipeline:
         title = app_name or _fallback_title(prompt)
 
         version = await self._get_version(project_public_id, version_seq)
+        if version and version.status not in ACTIVE_STATUSES:
+            # 收尾前用户已取消：丢弃结果，不覆盖取消状态
+            return {
+                "status": "cancelled",
+                "message": version.error or "生成已取消",
+                "steps": await self.load_steps(project_public_id, version_seq),
+            }
         if version:
             version.status = "succeeded"
             version.html = html
@@ -338,6 +376,7 @@ class GenerationPipeline:
         analysis_raw: str,
         design_raw: str,
         previous_html: str | None,
+        history_prompts: list[str] | None = None,
     ) -> str:
         """阶段 3 代码生成：截断续写 + 整篇重跑兜底。
 
@@ -347,7 +386,9 @@ class GenerationPipeline:
         仍不完整则整篇重跑一次（模型可能产出更紧凑的完整页面）；
         最终仍失败才抛出可读错误。
         """
-        user = prompts.build_code_user(prompt, analysis_raw, design_raw, previous_html)
+        user = prompts.build_code_user(
+            prompt, analysis_raw, design_raw, previous_html, history_prompts
+        )
         for attempt in range(2):
             code_raw = await self._call_step(
                 project_public_id,
@@ -413,7 +454,14 @@ class GenerationPipeline:
 
         空内容重试一次：推理模型偶发把 token 预算耗在思考链上导致
         content 为空（research.md 风险 2），重试是最低成本的恢复路径。
+
+        阶段边界取消检查：用户在上一阶段执行期间点了「停止生成」时，
+        版本已被取消接口置为 cancelled，这里不再发起新的模型调用。
         """
+        version = await self._get_version(project_public_id, version_seq)
+        if version and version.status == "cancelled":
+            raise GenerationCancelled(step_seq)
+
         step = await self._get_step(project_public_id, version_seq, step_seq)
         if step:
             step.status = "running"
@@ -467,6 +515,30 @@ class GenerationPipeline:
             version.summary = json.dumps(existing, ensure_ascii=False)
         await self._db.commit()
 
+    async def _finalize_cancelled(
+        self, project_public_id: str, version_seq: int
+    ) -> None:
+        """阶段边界检测到取消：把仍活跃的收尾步骤与项目状态落为 cancelled。"""
+        steps_result = await self._db.execute(
+            select(Generation_steps).where(
+                Generation_steps.project_public_id == project_public_id,
+                Generation_steps.version_seq == version_seq,
+            )
+        )
+        for step in steps_result.scalars().all():
+            if step.status in ACTIVE_STATUSES:
+                step.status = "cancelled"
+                step.output = step.output or "已取消"
+                step.ended_at = step.ended_at or _iso(_now())
+        version = await self._get_version(project_public_id, version_seq)
+        if version and version.status in ACTIVE_STATUSES:
+            version.status = "cancelled"
+            version.error = "生成已取消"
+        project = await self._get_project(project_public_id)
+        if project and project.latest_status in ACTIVE_STATUSES:
+            project.latest_status = "cancelled"
+        await self._db.commit()
+
     async def _fail(
         self,
         project_public_id: str,
@@ -480,11 +552,12 @@ class GenerationPipeline:
             step.output = message
             step.ended_at = _iso(_now())
         version = await self._get_version(project_public_id, version_seq)
-        if version:
+        # 取消守卫：版本已被取消接口置为 cancelled 时，迟到的失败不得覆盖取消态
+        if version and version.status in ACTIVE_STATUSES:
             version.status = "failed"
             version.error = message
         project = await self._get_project(project_public_id)
-        if project:
+        if project and project.latest_status in ACTIVE_STATUSES:
             project.latest_status = "failed"
         self._db.add(
             Messages(

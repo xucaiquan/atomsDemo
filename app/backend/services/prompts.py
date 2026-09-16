@@ -24,11 +24,50 @@ ANALYZE_SYSTEM = """你是一名资深产品经理，负责把用户的一句话
 3. 需求超出轻量单页应用能力边界时（例如「做一个淘宝」），在 notes 中明确指出将交付的是精简版核心流程。"""
 
 
-def build_analyze_user(prompt: str, previous_html: str | None = None) -> str:
-    """构造阶段 1 的用户消息。"""
-    if previous_html:
+# 需求历史回看的最大条数与单条截断长度，避免上下文线性膨胀（research.md R5）。
+HISTORY_MAX_ITEMS = 6
+HISTORY_ITEM_CHARS = 200
+
+
+def build_history_block(history_prompts: list[str] | None) -> str:
+    """把本项目此前各版本的需求拼成「需求历史」上下文块。
+
+    用于让模型理解「继续刚刚的需求」「按之前说的」「再优化一下」这类
+    引用上文的指令——否则模型只看到孤立的当前短句，无法还原真实意图。
+    """
+    cleaned = [p.strip() for p in (history_prompts or []) if p and p.strip()]
+    if not cleaned:
+        return ""
+    lines = [
+        f"{i}. {item[:HISTORY_ITEM_CHARS]}"
+        for i, item in enumerate(cleaned[-HISTORY_MAX_ITEMS:], start=1)
+    ]
+    return (
+        "【本项目此前的需求历史（按时间先后，越靠后越新）】\n"
+        + "\n".join(lines)
+        + "\n\n"
+    )
+
+
+ANAPHORA_HINT = (
+    "重要：如果本次要求引用了上下文（如「继续」「刚才」「上面」「之前说的」"
+    "「按原来的」「再优化一下」等指代），请结合上面的需求历史理解它的真实含义，"
+    "把它当作对既有应用的延续或改进，而不是一个孤立、无法执行的新需求。\n\n"
+)
+
+
+def build_analyze_user(
+    prompt: str,
+    previous_html: str | None = None,
+    history_prompts: list[str] | None = None,
+) -> str:
+    """构造阶段 1 的用户消息（含需求历史，支持指代消解）。"""
+    history = build_history_block(history_prompts)
+    if previous_html or history:
         return (
-            "这是一个**已有应用的迭代需求**。请基于「保留已有功能 + 叠加新要求」的原则做需求分析。\n\n"
+            history
+            + ANAPHORA_HINT
+            + "这是一个**已有应用的迭代需求**。请基于「保留已有功能 + 叠加新要求」的原则做需求分析。\n\n"
             f"用户本次的新要求：\n{prompt}\n\n"
             "请输出迭代后应用的完整功能要点（既包含原有功能，也包含本次新增的功能）。"
         )
@@ -52,9 +91,14 @@ DESIGN_SYSTEM = """你是一名前端架构师，负责为一个**单个自包�
 3. 每一条 interactions 都必须产生真实的界面变化（数字变化、列表增删、图表重绘等），不允许静态占位或无效按钮。"""
 
 
-def build_design_user(prompt: str, analysis: str, previous_html: str | None = None) -> str:
-    """构造阶段 2 的用户消息。"""
-    base = f"用户需求：\n{prompt}\n\n阶段一的需求分析结果：\n{analysis}"
+def build_design_user(
+    prompt: str,
+    analysis: str,
+    previous_html: str | None = None,
+    history_prompts: list[str] | None = None,
+) -> str:
+    """构造阶段 2 的用户消息（含需求历史）。"""
+    base = build_history_block(history_prompts) + f"用户需求：\n{prompt}\n\n阶段一的需求分析结果：\n{analysis}"
     if previous_html:
         base += (
             "\n\n这是一次迭代。上一版页面的结构已经存在，请设计**在其基础上改进**的结构，"
@@ -105,13 +149,19 @@ def build_code_user(
     analysis: str,
     design: str,
     previous_html: str | None = None,
+    history_prompts: list[str] | None = None,
 ) -> str:
     """构造阶段 3 的用户消息。
 
-    多轮迭代时只回传**上一版 HTML + 本次新指令**，不回传完整对话历史
-    （对应 research.md R5：全量历史会让上下文随轮次线性膨胀）。
+    多轮迭代时回传**需求历史 + 上一版 HTML + 本次新指令**：需求历史用于
+    消解「继续刚刚的需求」这类指代，上一版 HTML 用于增量改进；不回传逐条
+    完整对话，避免上下文随轮次线性膨胀（research.md R5）。
     """
-    parts = [f"用户需求：\n{prompt}", f"需求分析：\n{analysis}", f"结构设计：\n{design}"]
+    parts = [
+        build_history_block(history_prompts) + ANAPHORA_HINT + f"用户需求：\n{prompt}",
+        f"需求分析：\n{analysis}",
+        f"结构设计：\n{design}",
+    ]
     if previous_html:
         parts.append(
             "以下是**上一版页面的完整源码**。请在它的基础上改进，"

@@ -4,7 +4,7 @@
  * 展示型组件：由 props 接收步骤数组并渲染，状态流转「等待 → 进行中 → 已完成/失败」。
  * 失败时在**对应步骤**上显示可读原因，而非只在全局提示。
  */
-import { AlertCircle, Check, Circle, Loader2 } from 'lucide-react';
+import { AlertCircle, Ban, Check, Circle, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { GenerationStep } from '@/lib/atoms';
 
@@ -19,6 +19,7 @@ const STATUS_LABEL: Record<string, string> = {
   running: '进行中',
   succeeded: '已完成',
   failed: '失败',
+  cancelled: '已取消',
 };
 
 /** 从步骤原始产出里截取一小段作为「思考片段」展示。 */
@@ -33,6 +34,7 @@ function StepIcon({ status }: { status: GenerationStep['status'] }) {
   if (status === 'running') return <Loader2 className="h-4 w-4 animate-spin text-sky-400" />;
   if (status === 'succeeded') return <Check className="h-4 w-4 text-emerald-400" />;
   if (status === 'failed') return <AlertCircle className="h-4 w-4 text-rose-400" />;
+  if (status === 'cancelled') return <Ban className="h-4 w-4 text-amber-400" />;
   return <Circle className="h-4 w-4 text-slate-600" />;
 }
 
@@ -51,6 +53,7 @@ export default function AgentSteps({ steps, failedMessage, compact }: AgentSteps
               step.status === 'running' && 'border-sky-500/40 bg-sky-500/5',
               step.status === 'succeeded' && 'border-emerald-500/25 bg-emerald-500/5',
               step.status === 'failed' && 'border-rose-500/40 bg-rose-500/5',
+              step.status === 'cancelled' && 'border-amber-500/30 bg-amber-500/5',
               step.status === 'pending' && 'border-slate-800 bg-slate-900/40',
             )}
           >
@@ -70,6 +73,7 @@ export default function AgentSteps({ steps, failedMessage, compact }: AgentSteps
                   step.status === 'running' && 'bg-sky-500/15 text-sky-300',
                   step.status === 'succeeded' && 'bg-emerald-500/15 text-emerald-300',
                   step.status === 'failed' && 'bg-rose-500/15 text-rose-300',
+                  step.status === 'cancelled' && 'bg-amber-500/15 text-amber-300',
                   step.status === 'pending' && 'bg-slate-800 text-slate-500',
                 )}
               >
