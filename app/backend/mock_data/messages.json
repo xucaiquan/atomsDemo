@@ -1,0 +1,50 @@
+[
+    {
+        "content": "做一个记账小工具，能记收入和支出，显示总余额",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc31",
+        "role": "user",
+        "version_seq": 1
+    },
+    {
+        "content": "已生成「轻记账」v1：支持记录收入与支出、删除记录并实时计算结余。",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc31",
+        "role": "assistant",
+        "version_seq": 1
+    },
+    {
+        "content": "再加一个收支分类统计卡片，能一眼看到总收入、总支出和结余",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc31",
+        "role": "user",
+        "version_seq": 2
+    },
+    {
+        "content": "已迭代生成「轻记账」v2：保留原有记账能力，新增总收入、总支出与结余三张统计卡片。",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc31",
+        "role": "assistant",
+        "version_seq": 2
+    },
+    {
+        "content": "做一个番茄钟，可以设置专注时长并统计今日完成次数",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc32",
+        "role": "user",
+        "version_seq": 1
+    },
+    {
+        "content": "已生成「番茄专注钟」v1：25 分钟专注与 5 分钟休息可切换，支持暂停、重置并统计今日完成数。",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc32",
+        "role": "assistant",
+        "version_seq": 1
+    },
+    {
+        "content": "做一个待办清单，支持添加、勾选完成和按状态筛选",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc33",
+        "role": "user",
+        "version_seq": 1
+    },
+    {
+        "content": "已生成「今日待办」v1：支持添加、勾选完成、删除与按状态筛选，并显示剩余数量。",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc33",
+        "role": "assistant",
+        "version_seq": 1
+    }
+]

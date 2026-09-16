@@ -1,0 +1,53 @@
+{
+    "title": "generation_steps",
+    "type": "object",
+    "description": "一次生成过程中所经历的阶段性环节及其状态",
+    "properties": {
+        "id": {
+            "type": "integer",
+            "description": "内部主键，自增"
+        },
+        "project_public_id": {
+            "type": "string",
+            "maxLength": 36,
+            "description": "所属项目的 public_id"
+        },
+        "version_seq": {
+            "type": "integer",
+            "description": "所属版本序号"
+        },
+        "seq": {
+            "type": "integer",
+            "description": "步骤序号 1..3"
+        },
+        "name": {
+            "type": "string",
+            "maxLength": 60,
+            "description": "需求分析/结构设计/代码生成"
+        },
+        "status": {
+            "type": "string",
+            "maxLength": 16,
+            "description": "pending/running/succeeded/failed"
+        },
+        "output": {
+            "type": "string",
+            "description": "该阶段原始产出，用于回放"
+        },
+        "started_at": {
+            "type": "string",
+            "description": "开始时间 ISO 字符串"
+        },
+        "ended_at": {
+            "type": "string",
+            "description": "结束时间 ISO 字符串"
+        }
+    },
+    "required": [
+        "project_public_id",
+        "version_seq",
+        "seq",
+        "name",
+        "status"
+    ]
+}

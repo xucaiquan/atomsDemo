@@ -1,0 +1,51 @@
+{
+    "title": "versions",
+    "type": "object",
+    "description": "一次完整生成所产出的结果快照",
+    "properties": {
+        "id": {
+            "type": "integer",
+            "description": "内部主键，自增"
+        },
+        "project_public_id": {
+            "type": "string",
+            "maxLength": 36,
+            "description": "所属项目的 public_id"
+        },
+        "seq": {
+            "type": "integer",
+            "description": "项目内序号，从 1 开始递增"
+        },
+        "prompt": {
+            "type": "string",
+            "description": "本次生成的用户输入，生成开始前即写入"
+        },
+        "html": {
+            "type": "string",
+            "description": "生成结果 HTML，失败时为空"
+        },
+        "summary": {
+            "type": "string",
+            "description": "阶段1、2 产出摘要的 JSON 字符串"
+        },
+        "status": {
+            "type": "string",
+            "maxLength": 16,
+            "description": "pending/running/succeeded/failed"
+        },
+        "error": {
+            "type": "string",
+            "description": "失败原因，面向用户的可读措辞"
+        },
+        "duration_ms": {
+            "type": "integer",
+            "description": "端到端耗时毫秒"
+        }
+    },
+    "required": [
+        "project_public_id",
+        "seq",
+        "prompt",
+        "status"
+    ]
+}

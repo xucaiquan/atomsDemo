@@ -1,0 +1,98 @@
+[
+    {
+        "name": "需求分析",
+        "output": "应用名：轻记账；核心功能：记录收入与支出、删除记录、实时计算结余；定位：轻量个人记账单页应用",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc31",
+        "seq": 1,
+        "status": "succeeded",
+        "version_seq": 1
+    },
+    {
+        "name": "结构设计",
+        "output": "布局：顶部标题，中部录入表单，下部记录列表与结余行；状态：records 内存数组；交互：提交新增并重算结余，点击删除移除",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc31",
+        "seq": 2,
+        "status": "succeeded",
+        "version_seq": 1
+    },
+    {
+        "name": "代码生成",
+        "output": "已产出完整页面源码",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc31",
+        "seq": 3,
+        "status": "succeeded",
+        "version_seq": 1
+    },
+    {
+        "name": "需求分析",
+        "output": "迭代需求：在保留记账能力基础上新增收支分类统计，一眼看到总收入、总支出与结余",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc31",
+        "seq": 1,
+        "status": "succeeded",
+        "version_seq": 2
+    },
+    {
+        "name": "结构设计",
+        "output": "保留录入表单与记录列表；新增顶部三张统计卡片（总收入/总支出/结余）；状态仍为 records 内存数组",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc31",
+        "seq": 2,
+        "status": "succeeded",
+        "version_seq": 2
+    },
+    {
+        "name": "代码生成",
+        "output": "已产出完整页面源码",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc31",
+        "seq": 3,
+        "status": "succeeded",
+        "version_seq": 2
+    },
+    {
+        "name": "需求分析",
+        "output": "应用名：番茄专注钟；核心功能：25 分钟专注计时、休息切换、暂停重置、今日完成计数",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc32",
+        "seq": 1,
+        "status": "succeeded",
+        "version_seq": 1
+    },
+    {
+        "name": "结构设计",
+        "output": "布局：居中卡片，含模式标签、大号计时器、操作按钮组与计数；状态：remain/isFocus/done/timer；交互：开始暂停、重置、模式切换、到点自动切换并计数",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc32",
+        "seq": 2,
+        "status": "succeeded",
+        "version_seq": 1
+    },
+    {
+        "name": "代码生成",
+        "output": "已产出完整页面源码",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc32",
+        "seq": 3,
+        "status": "succeeded",
+        "version_seq": 1
+    },
+    {
+        "name": "需求分析",
+        "output": "应用名：今日待办；核心功能：添加待办、勾选完成、删除任务、按状态筛选",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc33",
+        "seq": 1,
+        "status": "succeeded",
+        "version_seq": 1
+    },
+    {
+        "name": "结构设计",
+        "output": "布局：顶部录入行、筛选标签行、任务列表、底部统计；状态：todos 数组与 filter；交互：添加、勾选切换完成态、删除、筛选重绘",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc33",
+        "seq": 2,
+        "status": "succeeded",
+        "version_seq": 1
+    },
+    {
+        "name": "代码生成",
+        "output": "已产出完整页面源码",
+        "project_public_id": "9c1f2a34-7b6d-4e2a-9f01-aa10bb20cc33",
+        "seq": 3,
+        "status": "succeeded",
+        "version_seq": 1
+    }
+]

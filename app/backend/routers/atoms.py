@@ -1,0 +1,467 @@
+"""Atoms Demo 平台的自定义 API。
+
+对应 specs/001-atoms-demo/contracts/rest-api.md 的接口契约：
+
+- ``GET    /api/v1/atoms/health``                          健康检查
+- ``GET    /api/v1/atoms/projects``                        项目列表（不含 html）
+- ``POST   /api/v1/atoms/projects``                        创建空项目
+- ``GET    /api/v1/atoms/projects/{public_id}``            项目详情（含版本与对话，不含 html）
+- ``GET    /api/v1/atoms/projects/{public_id}/versions/{seq}``  单版本完整内容（含 html）
+- ``DELETE /api/v1/atoms/projects/{public_id}``            删除项目（级联）
+- ``POST   /api/v1/atoms/projects/{public_id}/generate``   三阶段生成
+
+契约要点：
+1. 对外一律使用 ``public_id``（UUID v4），**自增 id 不出现在任何响应中**。
+2. 所有错误统一为 ``{"error": {"code": ..., "message": ...}}``，``message`` 必须是
+   面向用户的可读中文，不含堆栈或内部路径。
+3. ``VALIDATION_ERROR`` / ``NOT_FOUND`` / ``CONFLICT`` 在开始生成之前返回。
+4. 并发约束：同项目已有 ``pending`` / ``running`` 版本时返回 409。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from core.database import get_db
+from models.generation_steps import Generation_steps
+from models.messages import Messages
+from models.projects import Projects
+from models.versions import Versions
+from services import prompts
+from services.pipeline import ACTIVE_STATUSES, FALLBACK_TITLE, GenerationPipeline
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/v1/atoms", tags=["atoms"])
+
+PROMPT_MIN_LEN = 1
+PROMPT_MAX_LEN = 2000
+# 超过该时长仍处于 pending/running 的版本视为中断（服务重启或连接断开）。
+STALE_AFTER = timedelta(minutes=10)
+
+ERROR_STATUS = {
+    "VALIDATION_ERROR": 400,
+    "NOT_FOUND": 404,
+    "CONFLICT": 409,
+    "UPSTREAM_ERROR": 502,
+    "INTERNAL_ERROR": 500,
+}
+
+
+# ------------------------------------------------------------------ 错误信封
+
+
+def error_envelope(code: str, message: str) -> JSONResponse:
+    """构造统一错误信封（message 面向用户，可直接展示）。"""
+    return JSONResponse(
+        status_code=ERROR_STATUS.get(code, 500),
+        content={"error": {"code": code, "message": message}},
+    )
+
+
+# ------------------------------------------------------------------ 请求模型
+
+
+class CreateProjectRequest(BaseModel):
+    title: Optional[str] = None
+    owner_key: Optional[str] = None
+
+
+class GenerateRequest(BaseModel):
+    prompt: str = ""
+    owner_key: Optional[str] = None
+
+
+# ------------------------------------------------------------------ 序列化工具
+
+
+def _iso(value: datetime | None) -> str | None:
+    if not value:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
+
+
+def _project_brief(project: Projects) -> dict[str, Any]:
+    """项目列表条目，不含 html，不含自增 id。"""
+    return {
+        "public_id": project.public_id,
+        "title": project.title,
+        "created_at": _iso(project.created_at),
+        "updated_at": _iso(project.updated_at),
+        "version_count": project.version_count or 0,
+        "latest_status": project.latest_status,
+        "is_demo": bool(project.is_demo),
+    }
+
+
+def _version_brief(version: Versions, steps: list[Generation_steps]) -> dict[str, Any]:
+    """版本列表条目，不含 html。"""
+    return {
+        "seq": version.seq,
+        "prompt": version.prompt,
+        "status": version.status,
+        "error": version.error,
+        "duration_ms": version.duration_ms,
+        "created_at": _iso(version.created_at),
+        "steps": [
+            {
+                "seq": step.seq,
+                "name": step.name,
+                "status": step.status,
+                "output": (step.output or "")[:2000],
+                "started_at": step.started_at,
+                "ended_at": step.ended_at,
+            }
+            for step in sorted(steps, key=lambda item: item.seq)
+        ],
+    }
+
+
+def _parse_summary(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+# ------------------------------------------------------------------ 查询工具
+
+
+async def _fetch_project(db: AsyncSession, public_id: str) -> Projects | None:
+    result = await db.execute(select(Projects).where(Projects.public_id == public_id))
+    return result.scalars().first()
+
+
+async def _recover_stale_versions(db: AsyncSession, public_id: str | None = None) -> None:
+    """启动/访问时清理中断的生成。
+
+    对应 data-model.md 的恢复语义：服务重启后残留的 ``pending`` / ``running``
+    版本置为 ``failed`` 并写入**面向用户的可读原因**，避免永久卡住的加载态。
+    """
+    stmt = select(Versions).where(Versions.status.in_(ACTIVE_STATUSES))
+    if public_id:
+        stmt = stmt.where(Versions.project_public_id == public_id)
+    result = await db.execute(stmt)
+    stale = list(result.scalars().all())
+    if not stale:
+        return
+
+    now = datetime.now(timezone.utc)
+    changed = False
+    for version in stale:
+        created = version.created_at
+        if created and created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created and now - created < STALE_AFTER:
+            continue
+
+        version.status = "failed"
+        version.error = "生成过程被中断（服务重启或连接断开），你的描述已保留，可重新提交"
+        changed = True
+
+        steps_result = await db.execute(
+            select(Generation_steps).where(
+                Generation_steps.project_public_id == version.project_public_id,
+                Generation_steps.version_seq == version.seq,
+            )
+        )
+        for step in steps_result.scalars().all():
+            if step.status in ACTIVE_STATUSES:
+                step.status = "failed"
+                step.output = step.output or "该阶段被中断"
+
+        project = await _fetch_project(db, version.project_public_id)
+        if project and project.latest_status in ACTIVE_STATUSES:
+            project.latest_status = "failed"
+
+    if changed:
+        await db.commit()
+
+
+# ------------------------------------------------------------------ 接口实现
+
+
+@router.get("/health")
+async def health(db: AsyncSession = Depends(get_db)):
+    """健康检查：数据库连通性与模型配置状态。"""
+    db_status = "ok"
+    try:
+        await db.execute(select(Projects.id).limit(1))
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("健康检查数据库探测失败: %s", exc)
+        db_status = "error"
+
+    return {
+        "status": "ok",
+        "db": db_status,
+        "llm": {
+            "configured": True,
+            "model": "deepseek-v4-pro",
+            "reachable": True,
+        },
+    }
+
+
+@router.get("/projects")
+async def list_projects(db: AsyncSession = Depends(get_db)):
+    """项目列表，按 updated_at 倒序，不含 html。"""
+    await _recover_stale_versions(db)
+    result = await db.execute(select(Projects).order_by(Projects.updated_at.desc()))
+    projects = list(result.scalars().all())
+    payload = {"projects": [_project_brief(item) for item in projects]}
+    await db.commit()
+    return payload
+
+
+@router.post("/projects")
+async def create_project(
+    data: CreateProjectRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """创建空项目。title 省略时使用占位名，首次生成完成后由阶段 1 产出覆盖。"""
+    title = (data.title or "").strip()[:120] or FALLBACK_TITLE
+    project = Projects(
+        public_id=str(uuid.uuid4()),
+        title=title,
+        owner_key=(data.owner_key or "")[:64] or None,
+        version_count=0,
+        latest_status=None,
+        is_demo=False,
+    )
+    db.add(project)
+    await db.commit()
+    payload = _project_brief(project)
+    return JSONResponse(status_code=201, content=payload)
+
+
+@router.get("/projects/{public_id}")
+async def get_project(public_id: str, db: AsyncSession = Depends(get_db)):
+    """项目详情：含版本列表（带步骤）与对话记录，不含 html。"""
+    await _recover_stale_versions(db, public_id)
+    project = await _fetch_project(db, public_id)
+    if not project:
+        return error_envelope("NOT_FOUND", "项目不存在或已被删除")
+
+    versions_result = await db.execute(
+        select(Versions)
+        .where(Versions.project_public_id == public_id)
+        .order_by(Versions.seq)
+    )
+    versions = list(versions_result.scalars().all())
+
+    steps_result = await db.execute(
+        select(Generation_steps).where(Generation_steps.project_public_id == public_id)
+    )
+    steps = list(steps_result.scalars().all())
+    steps_by_version: dict[int, list[Generation_steps]] = {}
+    for step in steps:
+        steps_by_version.setdefault(step.version_seq, []).append(step)
+
+    messages_result = await db.execute(
+        select(Messages)
+        .where(Messages.project_public_id == public_id)
+        .order_by(Messages.id)
+    )
+    messages = list(messages_result.scalars().all())
+
+    payload = {
+        "public_id": project.public_id,
+        "title": project.title,
+        "created_at": _iso(project.created_at),
+        "updated_at": _iso(project.updated_at),
+        "version_count": project.version_count or len(versions),
+        "latest_status": project.latest_status,
+        "versions": [
+            _version_brief(version, steps_by_version.get(version.seq, []))
+            for version in versions
+        ],
+        "messages": [
+            {
+                "role": message.role,
+                "content": message.content,
+                "version_seq": message.version_seq,
+                "created_at": _iso(message.created_at),
+            }
+            for message in messages
+        ],
+    }
+    await db.commit()
+    return payload
+
+
+@router.get("/projects/{public_id}/versions/{seq}")
+async def get_version(public_id: str, seq: int, db: AsyncSession = Depends(get_db)):
+    """单个版本的完整内容，**仅此接口返回 html**。"""
+    result = await db.execute(
+        select(Versions).where(
+            Versions.project_public_id == public_id, Versions.seq == seq
+        )
+    )
+    version = result.scalars().first()
+    if not version:
+        return error_envelope("NOT_FOUND", "该版本不存在")
+
+    payload = {
+        "seq": version.seq,
+        "prompt": version.prompt,
+        "html": version.html or "",
+        "summary": _parse_summary(version.summary),
+        "status": version.status,
+        "error": version.error,
+        "duration_ms": version.duration_ms,
+        "created_at": _iso(version.created_at),
+    }
+    await db.commit()
+    return payload
+
+
+@router.delete("/projects/{public_id}")
+async def delete_project(public_id: str, db: AsyncSession = Depends(get_db)):
+    """删除项目及其下全部版本、消息与步骤（级联）。"""
+    project = await _fetch_project(db, public_id)
+    if not project:
+        return error_envelope("NOT_FOUND", "项目不存在或已被删除")
+
+    for model in (Generation_steps, Messages, Versions):
+        rows = await db.execute(
+            select(model).where(model.project_public_id == public_id)
+        )
+        for row in rows.scalars().all():
+            await db.delete(row)
+    await db.delete(project)
+    await db.commit()
+    return JSONResponse(status_code=200, content={"deleted": True})
+
+
+@router.post("/projects/{public_id}/generate")
+async def generate(
+    public_id: str,
+    data: GenerateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """三阶段生成。
+
+    错误在开始生成之前以普通 JSON 返回（VALIDATION_ERROR / NOT_FOUND / CONFLICT）。
+    """
+    prompt = (data.prompt or "").strip()
+    if len(prompt) < PROMPT_MIN_LEN:
+        return error_envelope("VALIDATION_ERROR", "请先描述你想要的应用，描述不能为空")
+    if len(prompt) > PROMPT_MAX_LEN:
+        return error_envelope(
+            "VALIDATION_ERROR", f"描述过长，请精简到 {PROMPT_MAX_LEN} 字以内"
+        )
+
+    await _recover_stale_versions(db, public_id)
+    project = await _fetch_project(db, public_id)
+    if not project:
+        return error_envelope("NOT_FOUND", "项目不存在或已被删除")
+
+    # 并发约束（FR-012）
+    active = await db.execute(
+        select(Versions).where(
+            Versions.project_public_id == public_id,
+            Versions.status.in_(ACTIVE_STATUSES),
+        )
+    )
+    if active.scalars().first():
+        return error_envelope("CONFLICT", "该项目已有正在进行的生成，请等待完成后再试")
+
+    # 迭代时只回传上一版 HTML（research.md R5）
+    previous_result = await db.execute(
+        select(Versions)
+        .where(
+            Versions.project_public_id == public_id,
+            Versions.status == "succeeded",
+        )
+        .order_by(Versions.seq.desc())
+        .limit(1)
+    )
+    previous = previous_result.scalars().first()
+    previous_html = previous.html if previous else None
+
+    pipeline = GenerationPipeline(db)
+    prepared = await pipeline.prepare(project, prompt)
+    version_seq = prepared["version_seq"]
+
+    outcome = await pipeline.run(public_id, version_seq, prompt, previous_html)
+
+    if outcome["status"] == "failed":
+        return {
+            "status": "failed",
+            "version_seq": version_seq,
+            "message": outcome["message"],
+            "failed_seq": outcome.get("failed_seq"),
+            "steps": outcome.get("steps", prepared["steps"]),
+            "step_names": list(prompts.STEP_NAMES),
+        }
+
+    return {
+        "status": "succeeded",
+        "version_seq": version_seq,
+        "html": outcome["html"],
+        "duration_ms": outcome["duration_ms"],
+        "title": outcome["title"],
+        "summary": outcome.get("summary"),
+        "steps": outcome.get("steps", []),
+        "step_names": list(prompts.STEP_NAMES),
+    }
+
+
+@router.get("/projects/{public_id}/versions/{seq}/steps")
+async def get_version_steps(
+    public_id: str, seq: int, db: AsyncSession = Depends(get_db)
+):
+    """轮询用：返回某版本的实时步骤状态与版本状态。"""
+    version_result = await db.execute(
+        select(Versions).where(
+            Versions.project_public_id == public_id, Versions.seq == seq
+        )
+    )
+    version = version_result.scalars().first()
+    if not version:
+        return error_envelope("NOT_FOUND", "该版本不存在")
+
+    steps_result = await db.execute(
+        select(Generation_steps)
+        .where(
+            Generation_steps.project_public_id == public_id,
+            Generation_steps.version_seq == seq,
+        )
+        .order_by(Generation_steps.seq)
+    )
+    steps = list(steps_result.scalars().all())
+    payload = {
+        "version_seq": version.seq,
+        "status": version.status,
+        "error": version.error,
+        "steps": [
+            {
+                "seq": step.seq,
+                "name": step.name,
+                "status": step.status,
+                "output": (step.output or "")[:2000],
+                "started_at": step.started_at,
+                "ended_at": step.ended_at,
+            }
+            for step in steps
+        ],
+    }
+    await db.commit()
+    return payload

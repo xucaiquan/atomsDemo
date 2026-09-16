@@ -1,0 +1,43 @@
+{
+    "title": "projects",
+    "type": "object",
+    "description": "用户围绕一个应用想法所展开的全部工作的载体",
+    "properties": {
+        "id": {
+            "type": "integer",
+            "description": "内部主键，自增，不对外暴露"
+        },
+        "public_id": {
+            "type": "string",
+            "maxLength": 36,
+            "description": "对外标识 UUID v4，唯一"
+        },
+        "title": {
+            "type": "string",
+            "maxLength": 120,
+            "description": "项目名"
+        },
+        "owner_key": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "浏览器会话标识，无账号体系下的归属键"
+        },
+        "version_count": {
+            "type": "integer",
+            "description": "版本数量，冗余字段便于列表展示"
+        },
+        "latest_status": {
+            "type": "string",
+            "maxLength": 16,
+            "description": "最新版本状态 pending/running/succeeded/failed"
+        },
+        "is_demo": {
+            "type": "boolean",
+            "description": "是否为演示种子项目"
+        }
+    },
+    "required": [
+        "public_id",
+        "title"
+    ]
+}
