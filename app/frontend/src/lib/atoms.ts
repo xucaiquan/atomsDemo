@@ -67,16 +67,25 @@ export interface VersionDetail {
   created_at: string | null;
 }
 
-export interface GenerateOutcome {
-  status: 'succeeded' | 'failed';
+/**
+ * 生成受理响应。
+ *
+ * 后端三阶段流水线耗时远超网关 120s 代理读超时，generate 接口改为异步受理：
+ * 毫秒级返回 202 + 版本号，前端通过 getVersionSteps 轮询真实进度与终态。
+ */
+export interface GenerateAccepted {
+  status: 'accepted';
   version_seq: number;
-  html?: string;
-  duration_ms?: number;
-  title?: string;
-  message?: string;
-  failed_seq?: number;
   steps: GenerationStep[];
   step_names: string[];
+}
+
+/** 轮询快照：版本终态 + 实时步骤。 */
+export interface StepsSnapshot {
+  version_seq: number;
+  status: VersionStatus;
+  error: string | null;
+  steps: GenerationStep[];
 }
 
 /** 三阶段步骤名，前端在提交瞬间即用它本地渲染骨架，不等任何网络往返。 */
@@ -174,12 +183,12 @@ export const atomsApi = {
     );
   },
 
-  /** 轮询某版本的实时步骤状态。 */
-  getVersionSteps(
-    publicId: string,
-    seq: number,
-  ): Promise<{ version_seq: number; status: VersionStatus; error: string | null; steps: GenerationStep[] }> {
-    return invoke(`/api/v1/atoms/projects/${publicId}/versions/${seq}/steps`, 'GET');
+  /** 轮询某版本的实时步骤状态与版本终态。 */
+  getVersionSteps(publicId: string, seq: number): Promise<StepsSnapshot> {
+    return invoke<StepsSnapshot>(
+      `/api/v1/atoms/projects/${publicId}/versions/${seq}/steps`,
+      'GET',
+    );
   },
 
   /** 删除项目（级联删除版本、消息与步骤）。 */
@@ -188,16 +197,16 @@ export const atomsApi = {
   },
 
   /**
-   * 触发三阶段生成。
+   * 受理三阶段生成（异步）。
    *
-   * 内部串联 3 次模型调用，因此必须放宽前端超时到 600s。
+   * 后端只做校验 + 落库后立即返回 202（毫秒级），三阶段在后台任务中执行，
+   * 彻底避开网关 120s 代理读超时。前端拿到 version_seq 后轮询 getVersionSteps。
    */
-  generate(publicId: string, prompt: string): Promise<GenerateOutcome> {
-    return invoke<GenerateOutcome>(
+  generate(publicId: string, prompt: string): Promise<GenerateAccepted> {
+    return invoke<GenerateAccepted>(
       `/api/v1/atoms/projects/${publicId}/generate`,
       'POST',
       { prompt },
-      600_000,
     );
   },
 };

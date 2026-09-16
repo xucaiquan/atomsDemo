@@ -232,16 +232,27 @@ class GenerationPipeline:
             # ---------- 阶段 3 代码生成 ----------
             # 完整自包含 HTML 体积大，且 deepseek-v4-pro 为推理模型（思考链会占用
             # 输出预算），必须显式放宽 max_tokens，否则极易返回空内容。
-            code_raw = await self._call_step(
-                project_public_id,
-                version_seq,
-                step_seq=3,
-                model=CODE_MODEL,
-                system=prompts.CODE_SYSTEM,
-                user=prompts.build_code_user(prompt, analysis_raw, design_raw, previous_html),
-                max_tokens=16384,
-            )
-            html, extract_error = sanitize_generated_html(code_raw)
+            # 截断重试一次：偶发输出被 max_tokens 截断导致缺少 </html>，
+            # 重跑一次模型往往能收敛到更紧凑的完整页面。
+            code_raw = ""
+            html = ""
+            extract_error: str | None = None
+            for attempt in range(2):
+                code_raw = await self._call_step(
+                    project_public_id,
+                    version_seq,
+                    step_seq=3,
+                    model=CODE_MODEL,
+                    system=prompts.CODE_SYSTEM,
+                    user=prompts.build_code_user(prompt, analysis_raw, design_raw, previous_html),
+                    max_tokens=16384,
+                )
+                html, extract_error = sanitize_generated_html(code_raw)
+                if not extract_error:
+                    break
+                logger.warning(
+                    "代码生成第 %s 次产出未通过完整性校验: %s", attempt + 1, extract_error
+                )
             if extract_error:
                 raise PipelineError(extract_error, 3)
 

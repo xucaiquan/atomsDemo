@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -32,7 +33,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.database import get_db
+from core.database import db_manager, get_db
 from models.generation_steps import Generation_steps
 from models.messages import Messages
 from models.projects import Projects
@@ -349,16 +350,92 @@ async def delete_project(public_id: str, db: AsyncSession = Depends(get_db)):
     return JSONResponse(status_code=200, content={"deleted": True})
 
 
-@router.post("/projects/{public_id}/generate")
+# ------------------------------------------------------------------ 后台生成任务
+#
+# 三阶段流水线串联 3 次模型调用，整体耗时通常 1~4 分钟，**远超平台网关的 120s
+# 代理读超时**。若同步等待，用户会看到「origin did not return a complete response
+# within the 120-second Proxy Read Timeout window」，且请求被网关掐断后前端拿不到
+# 任何结果。因此生成改为：请求内只做校验 + 落库（毫秒级）→ 立即返回 202 受理 →
+# 三阶段在 asyncio 后台任务中用独立会话执行 → 前端轮询 steps 接口取终态。
+
+_RUNNING_TASKS: set[asyncio.Task] = set()
+
+
+async def _run_generation_in_background(
+    public_id: str,
+    version_seq: int,
+    prompt: str,
+    previous_html: str | None,
+) -> None:
+    """后台执行三阶段流水线，使用独立 DB 会话（请求会话此时已关闭）。"""
+    try:
+        async with db_manager.session() as session:
+            pipeline = GenerationPipeline(session)
+            outcome = await pipeline.run(public_id, version_seq, prompt, previous_html)
+            logger.info(
+                "后台生成结束 project=%s seq=%s status=%s",
+                public_id[:8],
+                version_seq,
+                outcome.get("status"),
+            )
+    except Exception as exc:  # noqa: BLE001 - 后台任务异常不得冒泡
+        logger.exception("后台生成任务异常: %s", exc)
+        try:
+            async with db_manager.session() as session:
+                result = await session.execute(
+                    select(Versions).where(
+                        Versions.project_public_id == public_id,
+                        Versions.seq == version_seq,
+                    )
+                )
+                version = result.scalars().first()
+                if version and version.status in ACTIVE_STATUSES:
+                    version.status = "failed"
+                    version.error = "生成过程出现异常，你的描述已保留，可重新提交"
+                project_result = await session.execute(
+                    select(Projects).where(Projects.public_id == public_id)
+                )
+                project = project_result.scalars().first()
+                if project and project.latest_status in ACTIVE_STATUSES:
+                    project.latest_status = "failed"
+                steps_result = await session.execute(
+                    select(Generation_steps).where(
+                        Generation_steps.project_public_id == public_id,
+                        Generation_steps.version_seq == version_seq,
+                        Generation_steps.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+                for step in steps_result.scalars().all():
+                    step.status = "failed"
+                    step.output = step.output or "该阶段被中断"
+                await session.commit()
+        except Exception as inner:  # noqa: BLE001
+            logger.exception("后台生成兜底落库失败: %s", inner)
+
+
+def _spawn_generation(
+    public_id: str, version_seq: int, prompt: str, previous_html: str | None
+) -> None:
+    """创建受跟踪的后台任务，防止 task 被 GC 提前回收。"""
+    task = asyncio.create_task(
+        _run_generation_in_background(public_id, version_seq, prompt, previous_html)
+    )
+    _RUNNING_TASKS.add(task)
+    task.add_done_callback(_RUNNING_TASKS.discard)
+
+
+@router.post("/projects/{public_id}/generate", status_code=202)
 async def generate(
     public_id: str,
     data: GenerateRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """三阶段生成。
+    """受理三阶段生成（异步）。
 
-    错误在开始生成之前以普通 JSON 返回（VALIDATION_ERROR / NOT_FOUND / CONFLICT）。
+    立即返回 ``{"status": "accepted", "version_seq": N, "steps": [...]}``，
+    前端改为轮询 ``/versions/{seq}/steps`` 获取真实进度与终态。
+    校验类错误在受理之前以错误信封返回（VALIDATION_ERROR / NOT_FOUND / CONFLICT）。
     """
     prompt = (data.prompt or "").strip()
     if len(prompt) < PROMPT_MIN_LEN:
@@ -400,26 +477,14 @@ async def generate(
     prepared = await pipeline.prepare(project, prompt)
     version_seq = prepared["version_seq"]
 
-    outcome = await pipeline.run(public_id, version_seq, prompt, previous_html)
-
-    if outcome["status"] == "failed":
-        return {
-            "status": "failed",
-            "version_seq": version_seq,
-            "message": outcome["message"],
-            "failed_seq": outcome.get("failed_seq"),
-            "steps": outcome.get("steps", prepared["steps"]),
-            "step_names": list(prompts.STEP_NAMES),
-        }
+    # 请求会话到此结束；三阶段在后台任务里用独立会话执行，
+    # 本接口毫秒级返回，彻底避开网关 120s 代理读超时。
+    _spawn_generation(public_id, version_seq, prompt, previous_html)
 
     return {
-        "status": "succeeded",
+        "status": "accepted",
         "version_seq": version_seq,
-        "html": outcome["html"],
-        "duration_ms": outcome["duration_ms"],
-        "title": outcome["title"],
-        "summary": outcome.get("summary"),
-        "steps": outcome.get("steps", []),
+        "steps": prepared["steps"],
         "step_names": list(prompts.STEP_NAMES),
     }
 

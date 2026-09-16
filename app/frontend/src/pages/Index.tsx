@@ -36,10 +36,17 @@ import {
   type GenerationStep,
   type ProjectBrief,
   type ProjectDetail,
+  type StepsSnapshot,
   type VersionBrief,
 } from '@/lib/atoms';
 
 const POLL_INTERVAL_MS = 2500;
+
+/**
+ * 前端等待后台生成终态的最长时间。略大于后端陈旧任务恢复阈值（10 分钟），
+ * 超时后后端会把卡住的版本标记为 failed，前端同步展示可读原因。
+ */
+const GENERATION_POLL_TIMEOUT_MS = 12 * 60 * 1000;
 
 export default function Index() {
   // ---------------- 项目与详情 ----------------
@@ -57,7 +64,6 @@ export default function Index() {
   const [html, setHtml] = useState('');
   const [activeSeq, setActiveSeq] = useState<number | null>(null);
   const [view, setView] = useState<'preview' | 'code'>('preview');
-  const pollRef = useRef<number | null>(null);
 
   // ---------------- 数据加载 ----------------
   const refreshProjects = useCallback(async () => {
@@ -105,9 +111,6 @@ export default function Index() {
 
   useEffect(() => {
     void refreshProjects();
-    return () => {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-    };
   }, [refreshProjects]);
 
   // ---------------- 版本切换（US3 / FR-007） ----------------
@@ -130,42 +133,88 @@ export default function Index() {
     [activeId, detail],
   );
 
-  // ---------------- 步骤轮询（US4：真实事件驱动） ----------------
-  const isGeneratingRef = useRef(false);
-
-  const startPolling = useCallback(
-    (publicId: string, expectedSeq: number) => {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-      pollRef.current = window.setInterval(async () => {
-        try {
-          const snapshot = await atomsApi.getVersionSteps(publicId, expectedSeq);
-          if (snapshot.steps.length) setSteps(snapshot.steps);
-          if (snapshot.status === 'failed' && !isGeneratingRef.current) {
-            // 生成请求本身会返回失败详情；这里兜底防止请求丢失
-            setFailedMessage(snapshot.error || '生成失败');
-          }
-        } catch {
-          /* 版本尚未落库或网络抖动，忽略并继续轮询 */
-        }
-      }, POLL_INTERVAL_MS);
-    },
-    [],
-  );
+  // ---------------- 后台生成轮询（异步受理 + 终态驱动） ----------------
+  // 后端 generate 毫秒级返回 202 受理，三阶段在 asyncio 后台任务中执行；
+  // 前端只轮询轻量的 steps 接口观察真实进度，直到 succeeded / failed。
+  const pollTimerRef = useRef<number | null>(null);
 
   const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      window.clearInterval(pollRef.current);
-      pollRef.current = null;
+    if (pollTimerRef.current) {
+      window.clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
     }
   }, []);
 
-  // ---------------- 提交生成（US1 + US3） ----------------
+  /** 轮询直到版本进入终态；网络抖动不中断，超时按失败处理。 */
+  const awaitGeneration = useCallback(
+    (publicId: string, seq: number) =>
+      new Promise<StepsSnapshot>((resolve) => {
+        const deadline = Date.now() + GENERATION_POLL_TIMEOUT_MS;
+        const tick = async () => {
+          let snapshot: StepsSnapshot | null = null;
+          try {
+            snapshot = await atomsApi.getVersionSteps(publicId, seq);
+            if (snapshot.steps.length) setSteps(snapshot.steps);
+          } catch {
+            /* steps 尚未落库或网络抖动，忽略并继续轮询 */
+          }
+          if (snapshot && (snapshot.status === 'succeeded' || snapshot.status === 'failed')) {
+            pollTimerRef.current = null;
+            resolve(snapshot);
+            return;
+          }
+          if (Date.now() > deadline) {
+            pollTimerRef.current = null;
+            resolve({
+              version_seq: seq,
+              status: 'failed',
+              error: '生成等待超时，请重试（你的描述已保留）',
+              steps: [],
+            });
+            return;
+          }
+          pollTimerRef.current = window.setTimeout(tick, POLL_INTERVAL_MS);
+        };
+        void tick();
+      }),
+    [],
+  );
+
+  /** 终态落地：成功取 HTML 渲染，失败展示可读原因，并刷新持久化数据。 */
+  const finishGeneration = useCallback(async (publicId: string, snapshot: StepsSnapshot) => {
+    if (snapshot.status === 'succeeded') {
+      try {
+        const full = await atomsApi.getVersion(publicId, snapshot.version_seq);
+        setHtml(full.html || '');
+        setActiveSeq(full.seq);
+        setFailedMessage(null);
+        toast.success('生成完成，在右侧直接体验');
+      } catch {
+        setFailedMessage('生成结果加载失败，可切换版本重试');
+      }
+    } else {
+      setFailedMessage(snapshot.error || '生成失败，你的描述已保留');
+      toast.error(snapshot.error || '生成失败，你的描述已保留');
+      if (snapshot.steps.length) setSteps(snapshot.steps);
+    }
+    try {
+      const [list, data] = await Promise.all([
+        atomsApi.listProjects(),
+        atomsApi.getProject(publicId),
+      ]);
+      setProjects(list);
+      setDetail(data);
+    } catch {
+      /* 刷新失败不影响已展示的生成结果 */
+    }
+  }, []);
+
+  // ---------------- 提交生成（US1 + US3，异步受理） ----------------
   const handleSubmit = useCallback(async () => {
     const text = prompt.trim();
     if (!text || isGenerating) return;
     setFailedMessage(null);
     setIsGenerating(true);
-    isGeneratingRef.current = true;
     setView('preview');
 
     // ① 提交瞬间本地渲染步骤骨架 —— 不等待任何网络往返（SC-002）
@@ -174,53 +223,65 @@ export default function Index() {
     try {
       // ② 无项目时先创建空项目
       let publicId = activeId;
-      let expectedSeq = (detail?.versions.length ?? 0) + 1;
       if (!publicId) {
         const created = await atomsApi.createProject();
         publicId = created.public_id;
-        expectedSeq = 1;
         setActiveId(publicId);
       }
 
-      startPolling(publicId, expectedSeq);
+      // ③ 受理生成：后端只做校验 + 落库，毫秒级返回 202 + version_seq。
+      //    旧实现同步等待三阶段（3 次模型调用，1~4 分钟），超过网关 120s
+      //    代理读超时被掐断 —— 这正是贪吃蛇生成失败的根因。
+      const accepted = await atomsApi.generate(publicId, text);
+      setPrompt('');
+      if (accepted.steps?.length) setSteps(accepted.steps);
 
-      // ③ 触发三阶段流水线（内部串联 3 次模型调用，超时已放宽到 600s）
-      const outcome = await atomsApi.generate(publicId, text);
-
-      stopPolling();
-
-      if (outcome.status === 'succeeded' && outcome.html) {
-        setHtml(outcome.html);
-        setActiveSeq(outcome.version_seq);
-        setSteps(outcome.steps);
-        setFailedMessage(null);
-        setPrompt('');
-        toast.success(`已生成「${outcome.title || '新应用'}」，在右侧直接体验`);
-      } else {
-        // 失败：保留用户输入（FR-011 / SC-007），在对应步骤显示原因
-        setSteps(outcome.steps);
-        setFailedMessage(outcome.message || '生成失败，请重试');
-        toast.error(outcome.message || '生成失败，你的描述已保留');
-      }
-
-      // ④ 刷新项目与对话数据（持久化验证）
-      const [list] = await Promise.all([refreshProjects(), openProject(publicId)]);
-      void list;
+      // ④ 轮询后台任务直到终态，再取 HTML 渲染
+      const snapshot = await awaitGeneration(publicId, accepted.version_seq);
+      setIsGenerating(false);
+      await finishGeneration(publicId, snapshot);
     } catch (e) {
       stopPolling();
+      setIsGenerating(false);
       const error = e as Error & { code?: string };
-      // 409 CONFLICT：该项目已有进行中的生成（FR-012）
+      // 受理前的校验错误（400/404/409）：输入保留（FR-011），骨架回退失败态
       setFailedMessage(error.message || '生成失败，请稍后重试');
       toast.error(error.message || '生成失败，你的描述已保留');
-      // 输入不清空，骨架回退为失败态
       setSteps((prev) =>
-        prev.map((s, i) => (s.status === 'running' || i === 0 ? { ...s, status: 'failed', output: error.message } : s)),
+        prev.map((s, i) =>
+          s.status === 'running' || i === 0
+            ? { ...s, status: 'failed', output: error.message }
+            : s,
+        ),
       );
-    } finally {
-      setIsGenerating(false);
-      isGeneratingRef.current = false;
     }
-  }, [prompt, isGenerating, activeId, detail, startPolling, stopPolling, refreshProjects, openProject]);
+  }, [prompt, isGenerating, activeId, awaitGeneration, finishGeneration, stopPolling]);
+
+  // ---------------- 刷新恢复：接回进行中的后台生成 ----------------
+  // 页面刷新 / 浏览器关闭后重新打开时，若项目存在 pending/running 版本
+  // （后端 asyncio 任务仍在执行），自动接回轮询直到终态，无需用户重新提交。
+  const resumedRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!detail || isGenerating) return;
+    const activeVersion = detail.versions.find(
+      (v) => v.status === 'pending' || v.status === 'running',
+    );
+    if (!activeVersion) return;
+    const key = `${detail.public_id}:${activeVersion.seq}`;
+    if (resumedRef.current === key) return;
+    resumedRef.current = key;
+    setIsGenerating(true);
+    setSteps(activeVersion.steps?.length ? activeVersion.steps : buildLocalSteps());
+    void (async () => {
+      const snapshot = await awaitGeneration(detail.public_id, activeVersion.seq);
+      setIsGenerating(false);
+      await finishGeneration(detail.public_id, snapshot);
+    })();
+  }, [detail, isGenerating, awaitGeneration, finishGeneration]);
+
+  // 组件卸载时清理轮询定时器
+  useEffect(() => stopPolling, [stopPolling]);
 
   // ---------------- 新建项目 ----------------
   const handleNewProject = useCallback(() => {
