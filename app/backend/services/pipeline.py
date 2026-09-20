@@ -153,9 +153,11 @@ class GenerationPipeline:
     2. :meth:`run` —— 执行三阶段 AI 调用，其间每个阶段用独立短 DB 阶段更新状态。
     """
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncSession, ai: AIHubService | None = None) -> None:
         self._db = db
-        self._ai = AIHubService()
+        # ai 可注入是测试地基的一部分：测试传 FakeAIHub 即可精确编排上游剧本，
+        # 无需真实 key、不花配额。生产路径 ai=None，仍构造真实服务。
+        self._ai = ai if ai is not None else AIHubService()
 
     # ------------------------------------------------------------------ 落库阶段
 

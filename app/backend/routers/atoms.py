@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -371,9 +372,26 @@ async def _run_generation_in_background(
     prompt: str,
     previous_html: str | None,
     history_prompts: list[str] | None = None,
+    session: AsyncSession | None = None,
 ) -> None:
-    """后台执行三阶段流水线，使用独立 DB 会话（请求会话此时已关闭）。"""
+    """后台执行三阶段流水线。
+
+    默认自开独立 DB 会话（请求会话此时已关闭）。``session`` 非空时复用它——
+    这是 GENERATION_INLINE 测试路径用的，它跑在请求内、请求会话仍然活着。
+    """
     try:
+        if session is not None:
+            pipeline = GenerationPipeline(session)
+            outcome = await pipeline.run(
+                public_id, version_seq, prompt, previous_html, history_prompts
+            )
+            logger.info(
+                "内联生成结束 project=%s seq=%s status=%s",
+                public_id[:8],
+                version_seq,
+                outcome.get("status"),
+            )
+            return
         async with db_manager.session() as session:
             pipeline = GenerationPipeline(session)
             outcome = await pipeline.run(
@@ -445,8 +463,20 @@ def _spawn_generation(
     prompt: str,
     previous_html: str | None,
     history_prompts: list[str] | None,
-) -> None:
-    """创建受跟踪的后台任务，注册到任务表以支持取消，并防止 task 被 GC 提前回收。"""
+) -> "asyncio.Task | None":
+    """创建受跟踪的后台任务，注册到任务表以支持取消，并防止 task 被 GC 提前回收。
+
+    当环境变量 GENERATION_INLINE 为真时，不创建后台任务，调用方必须 await 返回值
+    （见 generate 处理器）。**仅测试用**：让集成测试是确定性的，并且让流水线复用
+    测试注入的会话，而不是去连真实数据库。生产环境绝不可置位。
+
+    判定条件**只有**环境变量：``generate`` 恒有请求会话，若把「传入了会话」也当作
+    inline 依据，生产路径就会在请求内同步等待 1~4 分钟的流水线，撞上网关 120s
+    代理读超时（计划 Global Constraints 第 6 条）。
+    """
+    if os.getenv("GENERATION_INLINE"):
+        return None
+
     key = (public_id, version_seq)
     task = asyncio.create_task(
         _run_generation_in_background(
@@ -455,6 +485,7 @@ def _spawn_generation(
     )
     _RUNNING_TASKS[key] = task
     task.add_done_callback(lambda _t, k=key: _RUNNING_TASKS.pop(k, None))
+    return task
 
 
 @router.post("/projects/{public_id}/generate", status_code=202)
@@ -523,9 +554,19 @@ async def generate(
 
     # 请求会话到此结束；三阶段在后台任务里用独立会话执行，
     # 本接口毫秒级返回，彻底避开网关 120s 代理读超时。
-    _spawn_generation(
+    task = _spawn_generation(
         public_id, version_seq, prompt, previous_html, history_prompts
     )
+    if task is None:
+        # GENERATION_INLINE（仅测试）：请求内直接执行，复用请求会话。
+        await _run_generation_in_background(
+            public_id,
+            version_seq,
+            prompt,
+            previous_html,
+            history_prompts,
+            session=db,
+        )
 
     return {
         "status": "accepted",

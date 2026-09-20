@@ -17,6 +17,7 @@ logs/
 .env.development
 env/
 venv/
+.venv/
 ENV/
 .DS_Store
 .idea/
