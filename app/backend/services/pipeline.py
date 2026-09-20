@@ -1,17 +1,25 @@
 """三阶段智能体流水线编排。
 
-对应 specs/001-atoms-demo/research.md R1（三阶段串行）与 R10（先落库后执行）。
+对应 specs/001-atoms-demo/research.md R1（三阶段串行）与 R10（先落库后执行），
+以及设计文档 2026-09-20 S3（生成链路稳定性）：
 
-流水线契约：
 - 提交时即创建 ``versions`` 记录（status=pending）并预置 3 条 ``generation_steps``
   （status=pending），使前端提交后立即拿到完整步骤列表。
 - 各阶段开始时把步骤置 ``running`` 并写 ``started_at``，结束时置 ``succeeded``
   并写 ``ended_at`` 与该阶段原始产出 ``output``（为回放提供基础）。
-- 任一阶段失败：该步骤置 ``failed``，版本置 ``failed`` 并写入**面向用户的可读中文**原因。
+- 任一阶段失败：该步骤置 ``failed``，版本置 ``failed`` 并写入**面向用户的可读中文**原因，
+  同时在 ``versions.summary`` 里持久化 ``error_type`` / ``upstream_status`` / ``attempts``
+  便于排障（S3.5）。
+- 上游故障按 kind 分类处理：auth 不重试；rate_limit/timeout/upstream_5xx/unknown
+  退避重试；空内容降级 max_tokens 再试；截断走续写/重跑链（S3.1）。
+- 每次模型调用用 ``asyncio.wait_for`` 施加 240s 显式超时（S3.2），生成期间由
+  **独立 DB 会话**的心跳任务每 30s 刷新 ``versions.updated_at``，配合
+  routers 侧按 updated_at 的 stale 判定，长任务不再被误杀。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -21,14 +29,22 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.database import db_manager
 from models.generation_steps import Generation_steps
 from models.messages import Messages
 from models.projects import Projects
 from models.versions import Versions
 from schemas.aihub import ChatMessage, GenTxtRequest
-from services.aihub import AIHubService
-from services.html_extract import extract_html, inject_csp, is_complete_document
 from services import prompts
+from services.aihub import AIHubService
+from services.aihub_errors import UpstreamError
+from services.html_extract import (
+    extract_html,
+    has_duplicate_structure,
+    inject_csp,
+    is_complete_document,
+    looks_well_formed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +59,29 @@ CONTINUE_TAIL_CHARS = 2000
 # 续写产出若以完整文档开头，视为模型重开了整篇文档，直接采用新产出。
 _DOC_RESTART_PATTERN = re.compile(r"<!DOCTYPE\s+html|<html[\s>]", re.IGNORECASE)
 
+# S3.2 显式超时与心跳。三者关系（test_stale_recovery.py 断言同一常量）：
+# HEARTBEAT_INTERVAL(30s) < STALE_AFTER(10min) < 前端轮询上限(12min)
+STAGE_TIMEOUT = 240.0
+HEARTBEAT_INTERVAL = 30.0
+
+# S3.1 退避重试：rate_limit / timeout / upstream_5xx / unknown 最多 3 次尝试，
+# 间隔 0.5 → 1 → 2 秒。auth 不重试。
+RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+MAX_ATTEMPTS = 3
+
 ACTIVE_STATUSES = ("pending", "running")
 FALLBACK_TITLE = "未命名项目"
+
+# kind -> 面向用户的可读中文（重试耗尽后的最终文案）
+UPSTREAM_USER_MESSAGES = {
+    "auth": "模型服务鉴权失败，请联系管理员",
+    "rate_limit": "模型服务繁忙（限流），请稍后重试",
+    "timeout": "模型服务响应超时，请稍后重试",
+    "upstream_5xx": "模型服务暂时不可用，请稍后重试",
+    "empty": "模型返回了空内容，请重新提交生成",
+    "truncated": "生成的页面内容不完整（可能被截断），请简化需求后重试",
+    "unknown": "模型服务暂时不可用，请稍后重试",
+}
 
 
 def _now() -> datetime:
@@ -53,6 +90,31 @@ def _now() -> datetime:
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def classify_upstream_error(exc: Exception) -> UpstreamError:
+    """把底层异常映射为可分类的 UpstreamError（S3.1）。
+
+    openai SDK 的异常类型按名称匹配（避免对 openai 版本的硬依赖）；
+    映射失败时归 unknown 且 retriable=True——宁可多试一次。
+    """
+    name = type(exc).__name__
+    status_code: int | None = getattr(exc, "status_code", None)
+    if status_code is None:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+
+    if name in ("AuthenticationError", "PermissionDeniedError") or status_code in (401, 403):
+        return UpstreamError("auth", str(exc), status_code, retriable=False)
+    if name == "RateLimitError" or status_code == 429:
+        return UpstreamError("rate_limit", str(exc), status_code)
+    if name in ("APITimeoutError", "APIConnectionError", "TimeoutError", "ConnectionError") or isinstance(
+        exc, asyncio.TimeoutError
+    ):
+        return UpstreamError("timeout", str(exc), status_code)
+    if name == "InternalServerError" or (status_code is not None and status_code >= 500):
+        return UpstreamError("upstream_5xx", str(exc), status_code)
+    return UpstreamError("unknown", str(exc), status_code)
 
 
 def _extract_json_block(text: str) -> str:
@@ -128,12 +190,28 @@ def _merge_continuation(existing: str, continuation: str) -> str:
 
 
 class PipelineError(Exception):
-    """携带面向用户可读中文措辞的流水线错误。"""
+    """携带面向用户可读中文措辞的流水线错误。
 
-    def __init__(self, message: str, step_seq: int) -> None:
+    ``error_type`` / ``upstream_status`` / ``attempts`` 为 S3.5 可观测性字段，
+    会被持久化进 ``versions.summary``；保留 (message, step_seq) 位置参数兼容。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        step_seq: int,
+        retriable: bool = False,
+        error_type: str | None = None,
+        upstream_status: int | None = None,
+        attempts: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.step_seq = step_seq
+        self.retriable = retriable
+        self.error_type = error_type
+        self.upstream_status = upstream_status
+        self.attempts = attempts
 
 
 class GenerationCancelled(Exception):
@@ -150,12 +228,28 @@ class GenerationPipeline:
     使用方式（严格遵循数据库会话边界规则：慢的 AI 调用前后各自是独立的短 DB 阶段）：
 
     1. :meth:`prepare` —— 短 DB 阶段：校验并发、落库版本与 3 条步骤，然后 commit。
-    2. :meth:`run` —— 执行三阶段 AI 调用，其间每个阶段用独立短 DB 阶段更新状态。
+    2. :meth:`run` —— 执行三阶段 AI 调用，其间每个阶段用独立短 DB 阶段更新状态；
+       生成期间由独立会话的心跳任务刷新 ``versions.updated_at``。
+
+    ``ai`` 参数供测试注入 FakeAIHub（S4）；生产默认 ``AIHubService()``。
     """
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncSession, ai: Any | None = None) -> None:
         self._db = db
-        self._ai = AIHubService()
+        self._ai_override = ai
+        self._ai_service: Any | None = None
+
+    @property
+    def _ai(self) -> Any:
+        """惰性构造 AIHubService：prepare（纯落库阶段）不触碰 AI；
+
+        测试注入 FakeAIHub 时完全不实例化真实客户端（S4 可测性改造）。
+        """
+        if self._ai_override is not None:
+            return self._ai_override
+        if self._ai_service is None:
+            self._ai_service = AIHubService()
+        return self._ai_service
 
     # ------------------------------------------------------------------ 落库阶段
 
@@ -223,7 +317,7 @@ class GenerationPipeline:
     ) -> dict[str, Any]:
         """执行三阶段流水线并把结果落库。
 
-        ``history_prompts`` 是本项目此前各版本的需求列表（时间升序），
+        ``history_prompts`` 是本项目此前**成功版本**的需求列表（时间升序），
         用于让模型消解「继续刚刚的需求」「按之前说的」这类指代。
 
         Returns:
@@ -242,6 +336,35 @@ class GenerationPipeline:
             }
         await self._set_version_status(project_public_id, version_seq, "running")
 
+        # 心跳：AI 调用可能持续数分钟，独立会话每 30s 刷 updated_at，
+        # 防止 stale recovery 把进行中的长任务误判为中断（S3.2）。
+        heartbeat = asyncio.create_task(self._heartbeat(project_public_id, version_seq))
+        try:
+            outcome = await self._run_stages(
+                started,
+                project_public_id,
+                version_seq,
+                prompt,
+                previous_html,
+                history_prompts,
+            )
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        return outcome
+
+    async def _run_stages(
+        self,
+        started: datetime,
+        project_public_id: str,
+        version_seq: int,
+        prompt: str,
+        previous_html: str | None,
+        history_prompts: list[str] | None,
+    ) -> dict[str, Any]:
         try:
             # ---------- 阶段 1 需求分析 ----------
             analysis_raw = await self._call_step(
@@ -299,21 +422,31 @@ class GenerationPipeline:
                 "steps": await self.load_steps(project_public_id, version_seq),
             }
         except PipelineError as exc:
-            await self._fail(project_public_id, version_seq, exc.step_seq, exc.message)
+            await self._fail(
+                project_public_id,
+                version_seq,
+                exc.step_seq,
+                exc.message,
+                error_type=exc.error_type,
+                upstream_status=exc.upstream_status,
+                attempts=exc.attempts,
+            )
             return {
                 "status": "failed",
                 "message": exc.message,
                 "failed_seq": exc.step_seq,
+                "error_type": exc.error_type,
                 "steps": await self.load_steps(project_public_id, version_seq),
             }
         except Exception as exc:  # noqa: BLE001 - 兜底为可读中文提示
             logger.exception("生成流水线异常: %s", exc)
             message = "模型服务暂时不可用，请稍后重试"
-            await self._fail(project_public_id, version_seq, 3, message)
+            await self._fail(project_public_id, version_seq, 3, message, error_type="unknown")
             return {
                 "status": "failed",
                 "message": message,
                 "failed_seq": 3,
+                "error_type": "unknown",
                 "steps": await self.load_steps(project_public_id, version_seq),
             }
 
@@ -357,6 +490,13 @@ class GenerationPipeline:
         )
         await self._db.commit()
 
+        logger.info(
+            "project=%s seq=%s step=done model=%s attempt=- duration_ms=%s",
+            project_public_id[:8],
+            version_seq,
+            CODE_MODEL,
+            duration_ms,
+        )
         return {
             "status": "succeeded",
             "html": html,
@@ -366,7 +506,35 @@ class GenerationPipeline:
             "steps": await self.load_steps(project_public_id, version_seq),
         }
 
-    # ------------------------------------------------------------------ 内部工具
+    # ------------------------------------------------------------------ 心跳
+
+    async def _heartbeat(self, public_id: str, version_seq: int) -> None:
+        """每 30s 用**独立 DB 会话**刷新 versions.updated_at（S3.2）。
+
+        必须独立会话：SQLAlchemy AsyncSession 禁止被两个协程并发使用，
+        而心跳在 AI 调用（self._db 空闲于 await gentxt）期间持续运行。
+        仅在版本仍处于 ACTIVE_STATUSES 时刷新——取消后迟到的心跳不得写活。
+        """
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            try:
+                async with db_manager.session() as session:
+                    result = await session.execute(
+                        select(Versions).where(
+                            Versions.project_public_id == public_id,
+                            Versions.seq == version_seq,
+                        )
+                    )
+                    version = result.scalars().first()
+                    if version and version.status in ACTIVE_STATUSES:
+                        version.updated_at = datetime.now(timezone.utc)
+                        await session.commit()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 心跳失败不影响生成主流程
+                logger.warning("心跳刷新失败 project=%s seq=%s: %s", public_id[:8], version_seq, exc)
+
+    # ------------------------------------------------------------------ 阶段 3 恢复链
 
     async def _generate_code(
         self,
@@ -385,6 +553,10 @@ class GenerationPipeline:
         回传给模型，让它从中断处接着写，拼接后校验，最多两轮；
         仍不完整则整篇重跑一次（模型可能产出更紧凑的完整页面）；
         最终仍失败才抛出可读错误。
+
+        判定升级为 ``is_complete_document and looks_well_formed``（S3.4）：
+        拼接后若出现重复文档结构（模型续写时重开了整篇文档），直接采用
+        新产出而不是把两份文档拼在一起。
         """
         user = prompts.build_code_user(
             prompt, analysis_raw, design_raw, previous_html, history_prompts
@@ -404,7 +576,7 @@ class GenerationPipeline:
                 lowered = doc.lower()
                 if "<html" not in lowered and "<body" not in lowered:
                     break  # 不是有效页面，直接进入整篇重跑
-                if is_complete_document(doc):
+                if is_complete_document(doc) and looks_well_formed(doc):
                     return inject_csp(doc)
                 logger.warning(
                     "代码生成第 %s 轮产出截断（长度 %s），尝试续写第 %s 次",
@@ -422,7 +594,11 @@ class GenerationPipeline:
                     max_tokens=CODE_MAX_TOKENS,
                     history=[
                         ChatMessage(role="user", content=user),
-                        ChatMessage(role="assistant", content=doc),
+                        # 上下文预算闸门（S3.3）：只回传已产出文档的尾部片段
+                        ChatMessage(
+                            role="assistant",
+                            content=prompts.truncate_continue_history(doc),
+                        ),
                     ],
                 )
                 cont = extract_html(cont_raw)
@@ -432,12 +608,19 @@ class GenerationPipeline:
                     doc = cont  # 模型重开了整篇文档，直接采用新产出
                 else:
                     doc = _merge_continuation(doc, cont)
-            if is_complete_document(doc):
+                    if has_duplicate_structure(doc):
+                        # 正则 match 只匹配开头，模型在开头多输出一句解释就会
+                        # 漏判重开；用结构计数兜底，采用更完整的新产出。
+                        logger.warning("续写拼接后检测到重复文档结构，改用新产出")
+                        doc = cont
+                if is_complete_document(doc) and looks_well_formed(doc):
+                    return inject_csp(doc)
+            if is_complete_document(doc) and looks_well_formed(doc):
                 return inject_csp(doc)
             logger.warning("代码生成第 %s 轮续写后仍不完整", attempt + 1)
-        raise PipelineError(
-            "生成的页面内容不完整（可能被截断），请简化需求后重试", 3
-        )
+        raise PipelineError(UPSTREAM_USER_MESSAGES["truncated"], 3, error_type="truncated")
+
+    # ------------------------------------------------------------------ 模型调用
 
     async def _call_step(
         self,
@@ -452,8 +635,11 @@ class GenerationPipeline:
     ) -> str:
         """把步骤置 running 后调用模型（非流式，便于完整校验产出）。
 
-        空内容重试一次：推理模型偶发把 token 预算耗在思考链上导致
-        content 为空（research.md 风险 2），重试是最低成本的恢复路径。
+        S3.1/S3.2 的恢复策略：
+        - 每次调用用 ``asyncio.wait_for`` 施加 STAGE_TIMEOUT 显式超时；
+        - auth 类错误不重试，立即失败 + ERROR 日志；
+        - rate_limit / timeout / upstream_5xx / unknown 退避重试（0.5→1→2s，最多 3 次）；
+        - 空内容先原样重试一次，再降 max_tokens 试一次。
 
         阶段边界取消检查：用户在上一阶段执行期间点了「停止生成」时，
         版本已被取消接口置为 cancelled，这里不再发起新的模型调用。
@@ -477,23 +663,80 @@ class GenerationPipeline:
             model=model,
             max_tokens=max_tokens,
         )
-        last_error: Exception | None = None
-        for attempt in range(2):
+
+        attempts_used = 0
+        last_upstream: UpstreamError | None = None
+        for attempt in range(MAX_ATTEMPTS):
+            attempts_used = attempt + 1
+            call_started = _now()
             try:
-                response = await self._ai.gentxt(request)
+                response = await asyncio.wait_for(
+                    self._ai.gentxt(request), timeout=STAGE_TIMEOUT
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.exception("阶段 %s 模型调用失败: %s", step_seq, exc)
-                last_error = exc
+                upstream = (
+                    exc
+                    if isinstance(exc, UpstreamError)
+                    else classify_upstream_error(exc)
+                )
+                duration_ms = int((_now() - call_started).total_seconds() * 1000)
+                logger.error(
+                    "project=%s seq=%s step=%s model=%s attempt=%s duration_ms=%s "
+                    "upstream_kind=%s status=%s err=%s",
+                    project_public_id[:8],
+                    version_seq,
+                    step_seq,
+                    model,
+                    attempts_used,
+                    duration_ms,
+                    upstream.kind,
+                    upstream.status_code,
+                    upstream,
+                )
+                last_upstream = upstream
+                if not upstream.retriable:
+                    break
+                if attempt < MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(RETRY_BACKOFF_SECONDS[attempt])
                 continue
 
+            duration_ms = int((_now() - call_started).total_seconds() * 1000)
+            logger.info(
+                "project=%s seq=%s step=%s model=%s attempt=%s duration_ms=%s",
+                project_public_id[:8],
+                version_seq,
+                step_seq,
+                model,
+                attempts_used,
+                duration_ms,
+            )
             content = (getattr(response, "content", "") or "").strip()
             if content:
                 return content
-            logger.warning("阶段 %s 第 %s 次调用返回空内容", step_seq, attempt + 1)
 
-        if last_error is not None:
-            raise PipelineError("模型服务暂时不可用，请稍后重试", step_seq) from last_error
-        raise PipelineError("模型返回了空内容，请重新提交生成", step_seq)
+            # 空内容：最后一次尝试降 max_tokens（推理模型偶发把预算耗在思考链上）
+            logger.warning(
+                "阶段 %s 第 %s 次调用返回空内容", step_seq, attempts_used
+            )
+            last_upstream = UpstreamError("empty", "模型返回空内容", None)
+            if attempt == 0 and request.max_tokens and request.max_tokens > 4096:
+                request = request.model_copy(
+                    update={"max_tokens": max(4096, request.max_tokens // 2)}
+                )
+            if attempt < MAX_ATTEMPTS - 1:
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS[attempt])
+
+        kind = last_upstream.kind if last_upstream else "unknown"
+        message = UPSTREAM_USER_MESSAGES.get(kind, UPSTREAM_USER_MESSAGES["unknown"])
+        raise PipelineError(
+            message,
+            step_seq,
+            error_type=kind,
+            upstream_status=last_upstream.status_code if last_upstream else None,
+            attempts=attempts_used,
+        ) from last_upstream
+
+    # ------------------------------------------------------------------ 内部工具
 
     async def _finish_step(
         self,
@@ -520,10 +763,12 @@ class GenerationPipeline:
     ) -> None:
         """阶段边界检测到取消：把仍活跃的收尾步骤与项目状态落为 cancelled。"""
         steps_result = await self._db.execute(
-            select(Generation_steps).where(
+            select(Generation_steps)
+            .where(
                 Generation_steps.project_public_id == project_public_id,
                 Generation_steps.version_seq == version_seq,
             )
+            .execution_options(populate_existing=True)
         )
         for step in steps_result.scalars().all():
             if step.status in ACTIVE_STATUSES:
@@ -545,6 +790,9 @@ class GenerationPipeline:
         version_seq: int,
         step_seq: int,
         message: str,
+        error_type: str | None = None,
+        upstream_status: int | None = None,
+        attempts: int | None = None,
     ) -> None:
         step = await self._get_step(project_public_id, version_seq, step_seq)
         if step:
@@ -556,6 +804,16 @@ class GenerationPipeline:
         if version and version.status in ACTIVE_STATUSES:
             version.status = "failed"
             version.error = message
+            # S3.5 失败可观测：错误分类持久化进 summary JSON（不改模型列）
+            existing = _parse_json_payload(version.summary or "") or {}
+            if error_type:
+                existing["error_type"] = error_type
+            if upstream_status is not None:
+                existing["upstream_status"] = upstream_status
+            if attempts is not None:
+                existing["attempts"] = attempts
+            if error_type or upstream_status is not None or attempts is not None:
+                version.summary = json.dumps(existing, ensure_ascii=False)
         project = await self._get_project(project_public_id)
         if project and project.latest_status in ACTIVE_STATUSES:
             project.latest_status = "failed"
@@ -580,17 +838,25 @@ class GenerationPipeline:
             project.latest_status = status
         await self._db.commit()
 
+    # 取消接口在**另一个 DB 会话**写库，而本会话的流水线对象在 commit 后
+    # 不会过期（expire_on_commit=False）。默认的身份映射行为是「已加载对象
+    # 不被数据库结果覆盖」，于是阶段边界取消检查与失败守卫会读到陈旧状态、
+    # 守卫形同虚设。所有跨会话状态读取一律 populate_existing 强制刷新。
     async def _get_project(self, public_id: str) -> Projects | None:
         result = await self._db.execute(
-            select(Projects).where(Projects.public_id == public_id)
+            select(Projects)
+            .where(Projects.public_id == public_id)
+            .execution_options(populate_existing=True)
         )
         return result.scalars().first()
 
     async def _get_version(self, public_id: str, seq: int) -> Versions | None:
         result = await self._db.execute(
-            select(Versions).where(
+            select(Versions)
+            .where(
                 Versions.project_public_id == public_id, Versions.seq == seq
             )
+            .execution_options(populate_existing=True)
         )
         return result.scalars().first()
 
@@ -598,11 +864,13 @@ class GenerationPipeline:
         self, public_id: str, version_seq: int, step_seq: int
     ) -> Generation_steps | None:
         result = await self._db.execute(
-            select(Generation_steps).where(
+            select(Generation_steps)
+            .where(
                 Generation_steps.project_public_id == public_id,
                 Generation_steps.version_seq == version_seq,
                 Generation_steps.seq == step_seq,
             )
+            .execution_options(populate_existing=True)
         )
         return result.scalars().first()
 
@@ -616,6 +884,7 @@ class GenerationPipeline:
                 Generation_steps.version_seq == version_seq,
             )
             .order_by(Generation_steps.seq)
+            .execution_options(populate_existing=True)
         )
         steps = list(result.scalars().all())
         return [

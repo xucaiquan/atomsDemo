@@ -20,7 +20,7 @@
         "owner_key": {
             "type": "string",
             "maxLength": 64,
-            "description": "浏览器会话标识，无账号体系下的归属键"
+            "description": "归属键，取值形如 user:{sub} 或 anon:{nonce}.{sig}，由服务端派生（JWT > 签名 cookie > X-Atoms-Anon 头 > 新签发），不接受客户端传入"
         },
         "version_count": {
             "type": "integer",
