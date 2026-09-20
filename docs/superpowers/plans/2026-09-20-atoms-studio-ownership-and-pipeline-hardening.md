@@ -615,6 +615,11 @@ anon  = f"anon:{raw}"                                         → 54 字符 ✓
 user  = f"user:{sub}"                                         → 5 + 36 = 41 字符 ✓
 ```
 
+> **2026-09-20 修订（T3 执行期，见账本 Ruling 13）**：上式的前提「`sub` 为 UUID」在本平台
+> 不成立（`users.id` 是 `String(255)`，`projects.owner_key` 只有 `String(64)`）。实际实现
+> 为 `owner_key = f"user:{sha256(sub).hexdigest()[:32]}"`（37 字符）。**下文 Task 3 的
+> 代码片段按此理解**；Task 6 的 `owner_key` description 需同步。详见 spec 同名修订块。
+
 - [ ] **Step 1: 写签名与派的失败测试**
 
 ```python

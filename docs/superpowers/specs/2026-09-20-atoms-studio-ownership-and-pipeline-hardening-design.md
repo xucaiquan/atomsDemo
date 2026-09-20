@@ -82,6 +82,16 @@ owner_key = f"anon:{raw}"                → 54 字符  ✓
 owner_key = f"user:{sub}"                → 5 + 36 = 41 字符（sub 为 UUID）✓
 ```
 
+> **2026-09-20 修订（T3 执行期，见账本 Ruling 13）**：上面 `user:{sub}` 的 41 字符算式
+> 基于「`sub` 是 UUID」这一前提，而本平台不成立——`models/auth.py:12` 的 `users.id` 是
+> `String(255)`（注释「Use platform sub as primary key」），`services/auth.py:19,40` 把
+> OIDC 的 `sub` claim 原样存进去；而 `models/projects.py:15` 的 `owner_key` 只有
+> `String(64)`。`sub` 超过 59 字符即导致插入失败。**实际实现改为
+> `owner_key = f"user:{sha256(sub).hexdigest()[:32]}"`（37 字符）**：单格式、定宽、
+> 无静默碰撞（朴素截断会让共享前缀的两个 sub 并成同一身份）。`anon:` 分支不受影响。
+> 本文件其余部分不再改动；下游 T6 的 `owner_key` 字段 description 需同步为「用户 ID 的
+> 哈希」而非字面 ID。
+
 ---
 
 ## 4. 单元设计
