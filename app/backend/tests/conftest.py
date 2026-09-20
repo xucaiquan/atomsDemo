@@ -52,10 +52,24 @@ async def session_maker():
 
 
 @pytest_asyncio.fixture
-async def client(session_maker):
-    """ASGI 测试客户端，get_db 指向内存库。
+async def db_session(session_maker):
+    """直接读写内存库的会话，用于摆布夹具数据（如演示项目）或直接断言持久化结果。
 
-    ASGITransport 不会执行 lifespan，所以不会触发真实数据库连接。
+    与 ``client`` 共用同一个 ``session_maker``（pytest 按测试缓存夹具实例），
+    因此这里 commit 的行，路由的请求会话立刻看得到。
+    """
+    async with session_maker() as session:
+        yield session
+
+
+@pytest_asyncio.fixture
+async def atoms_app(session_maker):
+    """把 ``get_db`` 指向内存库，但**不**提供客户端。
+
+    单独拆出来是给「一个测试要起多个互不相干的会话」的用例用的：httpx 的
+    AsyncClient 会自动持久化 cookie，而 get_owner 的优先级是 cookie > 请求头，
+    所以归属隔离的越权矩阵必须给每个身份一个全新的 cookie jar。依赖这个夹具的
+    测试自己 ``AsyncClient(transport=ASGITransport(app=app))`` 即可拿到同一套依赖覆盖。
     """
 
     async def _override_get_db():
@@ -63,8 +77,17 @@ async def client(session_maker):
             yield session
 
     app.dependency_overrides[get_db] = _override_get_db
+    yield app
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def client(atoms_app):
+    """ASGI 测试客户端，get_db 指向内存库。
+
+    ASGITransport 不会执行 lifespan，所以不会触发真实数据库连接。
+    """
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as http_client:
         yield http_client
-    app.dependency_overrides.clear()

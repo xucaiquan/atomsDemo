@@ -68,6 +68,25 @@ def test_verify_rejects_wrong_number_of_parts():
     assert _verify("a.b.c") is None
 
 
+def test_verify_rejects_non_canonical_shape():
+    """形状必须与 ``_issue`` 的输出严格一致，否则 ``anon:`` 键会突破长度上限。
+
+    这是**有签名密钥**的攻击面：验签只保证「这个 nonce 是你签过的」，
+    不保证 nonce 有多长。攻击者可以发 ``atoms_anon=<超长 nonce>.<有效签名>``，
+    得到 ``anon:{超长 nonce}`` 归属键，超过 ``projects.owner_key`` 的 64 字符列限。
+    旧实现在写入处用 ``[:64]`` 截断把它盖住了；截断被删掉之后，这条路径就真的
+    能打穿写入——所以必须在验签处按形状拒绝。
+    """
+    long_nonce = "a" * 64
+    assert _verify(f"{long_nonce}.{_sign(long_nonce)}") is None
+
+    nonce = _issue().split(".")[0]
+    sig = _sign(nonce)
+    assert _verify(f"{'z' * 32}.{_sign('z' * 32)}") is None  # 非 hex
+    assert _verify(f"{nonce}.{sig}00") is None  # 签名过长
+    assert _verify(f"{nonce}.{sig[:8]}") is None  # 签名过短
+
+
 # ---------- 依赖：三级派生 ----------
 
 

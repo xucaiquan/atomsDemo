@@ -36,6 +36,8 @@ ANON_MAX_AGE = 180 * 24 * 3600
 
 _SIG_CHARS = 16
 _NONCE_BYTES = 16
+# token_hex(16) → 32 个小写十六进制字符；键长 5 + 32 + 1 + 16 = 54，稳在 String(64) 内。
+_NONCE_CHARS = _NONCE_BYTES * 2
 # user: 键取 sha256 前 32 个十六进制字符（128 bit）——足够避免碰撞，且总长固定 37。
 _SUBJECT_CHARS = 32
 
@@ -76,15 +78,29 @@ def _sign(nonce: str) -> str:
     return hmac.new(_secret(), nonce.encode("utf-8"), hashlib.sha256).hexdigest()[:_SIG_CHARS]
 
 
+def _is_lower_hex(value: str, length: int) -> bool:
+    """形状必须与 ``_issue`` 的输出严格一致：定长小写十六进制。"""
+    if len(value) != length:
+        return False
+    return all(char in "0123456789abcdef" for char in value)
+
+
 def _verify(raw: Optional[str]) -> Optional[str]:
-    """校验签名，通过则返回 nonce，否则返回 None。"""
+    """校验形状与签名，通过则返回 nonce，否则返回 None。
+
+    只验签不验形状是不够的：签名证明「这个 nonce 是你签过的」，不证明它有多长。
+    知道签名密钥的攻击者可以发 ``atoms_anon=<超长 nonce>.<有效签名>``，得到
+    ``anon:{超长 nonce}`` 归属键，超出 ``projects.owner_key`` 的 String(64) 列限——
+    写入要么报错、要么（若调用方截断）把不同 nonce 塌缩成同一身份。
+    这里按形状先拒绝，``anon:`` 键就被构造性地限死在 5+32+1+16=54 字符。
+    """
     if not raw:
         return None
     parts = raw.split(".")
     if len(parts) != 2:
         return None
     nonce, sig = parts
-    if not nonce or not sig:
+    if not _is_lower_hex(nonce, _NONCE_CHARS) or not _is_lower_hex(sig, _SIG_CHARS):
         return None
     expected = _sign(nonce)
     if not hmac.compare_digest(sig, expected):

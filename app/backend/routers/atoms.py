@@ -32,10 +32,16 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import db_manager, get_db
+from dependencies.owner import (
+    ANON_COOKIE,
+    ANON_MAX_AGE,
+    OwnerContext,
+    get_owner,
+)
 from models.generation_steps import Generation_steps
 from models.messages import Messages
 from models.projects import Projects
@@ -61,14 +67,54 @@ ERROR_STATUS = {
 }
 
 
-# ------------------------------------------------------------------ 错误信封
+# ------------------------------------------------------------------ 响应构造
+#
+# ``_json`` / ``error_envelope`` 是本模块所有响应的**唯一**构造路径：匿名身份
+# 的签名 cookie 由 ``_attach_owner`` 统一挂上，任何直接 ``JSONResponse(...)``
+# 都会漏掉 Set-Cookie——客户端下一次请求就成了另一个陌生人，看不到自己的项目。
 
 
-def error_envelope(code: str, message: str) -> JSONResponse:
+class RouteError(Exception):
+    """路由层的可预期错误，携带错误信封的 code 与面向用户的中文文案。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _attach_owner(resp: JSONResponse, ctx: OwnerContext | None) -> JSONResponse:
+    """匿名身份时下发签名的 HttpOnly cookie。
+
+    Secure 由 ATOMS_COOKIE_SECURE 控制：本地 http 必须关，生产 https 必须开。
+    """
+    if ctx and ctx.anon_key:
+        secure = os.getenv("ATOMS_COOKIE_SECURE", "").strip().lower() in ("1", "true", "yes")
+        resp.set_cookie(
+            key=ANON_COOKIE,
+            value=ctx.anon_key,
+            max_age=ANON_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            secure=secure,
+            path="/",
+        )
+    return resp
+
+
+def _json(payload: dict[str, Any], ctx: OwnerContext | None, status_code: int = 200) -> JSONResponse:
+    """构造响应。**所有** atoms 路由的成功路径都必须经过这里。"""
+    return _attach_owner(JSONResponse(status_code=status_code, content=payload), ctx)
+
+
+def error_envelope(code: str, message: str, ctx: OwnerContext | None = None) -> JSONResponse:
     """构造统一错误信封（message 面向用户，可直接展示）。"""
-    return JSONResponse(
-        status_code=ERROR_STATUS.get(code, 500),
-        content={"error": {"code": code, "message": message}},
+    return _attach_owner(
+        JSONResponse(
+            status_code=ERROR_STATUS.get(code, 500),
+            content={"error": {"code": code, "message": message}},
+        ),
+        ctx,
     )
 
 
@@ -142,19 +188,85 @@ def _parse_summary(raw: str | None) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+# ------------------------------------------------------------------ 归属过滤
+#
+# 这两条是本模块**唯一**的归属过滤入口。任何路由都不得自行拼 ``owner_key``
+# 的 where 条件，否则漏一条就是一次数据泄露（spec §2 不变量 1）。
+
+
+def _owned(stmt, owner: str):
+    """写路径：只能作用于本人的项目。"""
+    return stmt.where(Projects.owner_key == owner)
+
+
+def _visible(stmt, owner: str):
+    """读路径：本人的项目 + 演示项目（is_demo=true 对所有身份可见）。"""
+    return stmt.where(or_(Projects.owner_key == owner, Projects.is_demo.is_(True)))
+
+
+async def _require_project(
+    db: AsyncSession,
+    public_id: str,
+    ctx: OwnerContext,
+    *,
+    write: bool,
+) -> Projects:
+    """获取项目，不满足前置条件时抛 RouteError。
+
+    查找一律经过 ``_owned`` / ``_visible``，不另拼 where。
+
+    写路径先按 ``_owned`` 找本人的项目；找不到时再用 ``_visible`` 区分两种情况：
+    演示项目（所有身份可见但**不可写** → 409；演示项目在列表里本来就看得见，
+    用 404 会让人以为数据坏了）与「不存在或属于他人」（→ 404，fail-closed，
+    不泄露项目的存在性）。因此写路径的 happy case 仍然只有一条查询。
+    """
+    base = select(Projects).where(Projects.public_id == public_id)
+
+    if write:
+        owned = (await db.execute(_owned(base, ctx.owner_key))).scalars().first()
+        if owned is not None:
+            return owned
+        visible = (await db.execute(_visible(base, ctx.owner_key))).scalars().first()
+        if visible is None:
+            raise RouteError("NOT_FOUND", "项目不存在或已被删除")
+        raise RouteError(
+            "CONFLICT",
+            "这是演示项目，仅供浏览；请点左上角「新项目」创建你自己的项目",
+        )
+
+    visible = (await db.execute(_visible(base, ctx.owner_key))).scalars().first()
+    if visible is None:
+        raise RouteError("NOT_FOUND", "项目不存在或已被删除")
+    return visible
+
+
 # ------------------------------------------------------------------ 查询工具
 
 
 async def _fetch_project(db: AsyncSession, public_id: str) -> Projects | None:
+    """**不带归属过滤**的原始查询。
+
+    对外路由的项目查找一律走 ``_require_project``：读 ``write=False``、写
+    ``write=True``。本函数只留给「归属已经由别处确立」的内部路径——目前
+    ``generate`` / ``cancel_generation`` 的调用点尚未收口（Task 5），
+    失效版本清理的语义在 Task 6。
+    """
     result = await db.execute(select(Projects).where(Projects.public_id == public_id))
     return result.scalars().first()
 
 
-async def _recover_stale_versions(db: AsyncSession, public_id: str | None = None) -> None:
+async def _recover_stale_versions(
+    db: AsyncSession,
+    owner: str,
+    public_id: str | None = None,
+) -> None:
     """启动/访问时清理中断的生成。
 
     对应 data-model.md 的恢复语义：服务重启后残留的 ``pending`` / ``running``
     版本置为 ``failed`` 并写入**面向用户的可读原因**，避免永久卡住的加载态。
+
+    ``owner`` 形参目前**尚未参与过滤**——完整语义（只清理调用者可见项目下的
+    版本）在 Task 6 落地，本任务只为让调用方能编译通过。
     """
     stmt = select(Versions).where(Versions.status.in_(ACTIVE_STATUSES))
     if public_id:
@@ -222,19 +334,30 @@ async def health(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/projects")
-async def list_projects(db: AsyncSession = Depends(get_db)):
-    """项目列表，按 updated_at 倒序，不含 html。"""
-    await _recover_stale_versions(db)
-    result = await db.execute(select(Projects).order_by(Projects.updated_at.desc()))
+async def list_projects(
+    ctx: OwnerContext = Depends(get_owner),
+    db: AsyncSession = Depends(get_db),
+):
+    """项目列表，按 updated_at 倒序，不含 html。只返回本人与演示项目。"""
+    await _recover_stale_versions(db, ctx.owner_key)
+    result = await db.execute(
+        _visible(select(Projects), ctx.owner_key).order_by(Projects.updated_at.desc())
+    )
     projects = list(result.scalars().all())
-    payload = {"projects": [_project_brief(item) for item in projects]}
+    payload = {
+        "projects": [_project_brief(item) for item in projects],
+        # anon_key 让前端即使拿不到 cookie 也能持久化标识，作为请求头回传。
+        # 登录身份时为 None。
+        "anon_key": ctx.anon_key,
+    }
     await db.commit()
-    return payload
+    return _json(payload, ctx)
 
 
 @router.post("/projects")
 async def create_project(
     data: CreateProjectRequest,
+    ctx: OwnerContext = Depends(get_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """创建空项目。title 省略时使用占位名，首次生成完成后由阶段 1 产出覆盖。"""
@@ -242,24 +365,32 @@ async def create_project(
     project = Projects(
         public_id=str(uuid.uuid4()),
         title=title,
-        owner_key=(data.owner_key or "")[:64] or None,
+        # 归属键只来自服务端派生（spec §2 不变量 1）；请求体里的 owner_key
+        # 字段仍在模型上，但已不参与写入，Task 5 会把它一并删除。
+        owner_key=ctx.owner_key,
         version_count=0,
         latest_status=None,
         is_demo=False,
     )
     db.add(project)
     await db.commit()
-    payload = _project_brief(project)
-    return JSONResponse(status_code=201, content=payload)
+    # 必须走 _json 而非裸 JSONResponse：匿名身份要在这里 Set-Cookie，
+    # 否则创建者下一次请求就是另一个人，列表里看不到自己刚建的项目。
+    return _json(_project_brief(project), ctx, status_code=201)
 
 
 @router.get("/projects/{public_id}")
-async def get_project(public_id: str, db: AsyncSession = Depends(get_db)):
+async def get_project(
+    public_id: str,
+    ctx: OwnerContext = Depends(get_owner),
+    db: AsyncSession = Depends(get_db),
+):
     """项目详情：含版本列表（带步骤）与对话记录，不含 html。"""
-    await _recover_stale_versions(db, public_id)
-    project = await _fetch_project(db, public_id)
-    if not project:
-        return error_envelope("NOT_FOUND", "项目不存在或已被删除")
+    await _recover_stale_versions(db, ctx.owner_key, public_id)
+    try:
+        project = await _require_project(db, public_id, ctx, write=False)
+    except RouteError as exc:
+        return error_envelope(exc.code, exc.message, ctx)
 
     versions_result = await db.execute(
         select(Versions)
@@ -305,12 +436,22 @@ async def get_project(public_id: str, db: AsyncSession = Depends(get_db)):
         ],
     }
     await db.commit()
-    return payload
+    return _json(payload, ctx)
 
 
 @router.get("/projects/{public_id}/versions/{seq}")
-async def get_version(public_id: str, seq: int, db: AsyncSession = Depends(get_db)):
+async def get_version(
+    public_id: str,
+    seq: int,
+    ctx: OwnerContext = Depends(get_owner),
+    db: AsyncSession = Depends(get_db),
+):
     """单个版本的完整内容，**仅此接口返回 html**。"""
+    try:
+        await _require_project(db, public_id, ctx, write=False)
+    except RouteError as exc:
+        return error_envelope(exc.code, exc.message, ctx)
+
     result = await db.execute(
         select(Versions).where(
             Versions.project_public_id == public_id, Versions.seq == seq
@@ -331,11 +472,15 @@ async def get_version(public_id: str, seq: int, db: AsyncSession = Depends(get_d
         "created_at": _iso(version.created_at),
     }
     await db.commit()
-    return payload
+    return _json(payload, ctx)
 
 
 @router.delete("/projects/{public_id}")
-async def delete_project(public_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_project(
+    public_id: str,
+    ctx: OwnerContext = Depends(get_owner),
+    db: AsyncSession = Depends(get_db),
+):
     """删除项目及其下全部版本、消息与步骤（级联）。"""
     project = await _fetch_project(db, public_id)
     if not project:
@@ -497,6 +642,7 @@ async def generate(
     public_id: str,
     data: GenerateRequest,
     request: Request,
+    ctx: OwnerContext = Depends(get_owner),
     db: AsyncSession = Depends(get_db),
 ):
     """受理三阶段生成（异步）。
@@ -582,9 +728,17 @@ async def generate(
 
 @router.get("/projects/{public_id}/versions/{seq}/steps")
 async def get_version_steps(
-    public_id: str, seq: int, db: AsyncSession = Depends(get_db)
+    public_id: str,
+    seq: int,
+    ctx: OwnerContext = Depends(get_owner),
+    db: AsyncSession = Depends(get_db),
 ):
     """轮询用：返回某版本的实时步骤状态与版本状态。"""
+    try:
+        await _require_project(db, public_id, ctx, write=False)
+    except RouteError as exc:
+        return error_envelope(exc.code, exc.message, ctx)
+
     version_result = await db.execute(
         select(Versions).where(
             Versions.project_public_id == public_id, Versions.seq == seq
@@ -620,12 +774,15 @@ async def get_version_steps(
         ],
     }
     await db.commit()
-    return payload
+    return _json(payload, ctx)
 
 
 @router.post("/projects/{public_id}/versions/{seq}/cancel")
 async def cancel_generation(
-    public_id: str, seq: int, db: AsyncSession = Depends(get_db)
+    public_id: str,
+    seq: int,
+    ctx: OwnerContext = Depends(get_owner),
+    db: AsyncSession = Depends(get_db),
 ):
     """取消进行中的生成（中断任务能力）。
 
