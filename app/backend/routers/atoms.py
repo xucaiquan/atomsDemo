@@ -470,11 +470,15 @@ def _spawn_generation(
     （见 generate 处理器）。**仅测试用**：让集成测试是确定性的，并且让流水线复用
     测试注入的会话，而不是去连真实数据库。生产环境绝不可置位。
 
-    判定条件**只有**环境变量：``generate`` 恒有请求会话，若把「传入了会话」也当作
-    inline 依据，生产路径就会在请求内同步等待 1~4 分钟的流水线，撞上网关 120s
-    代理读超时（计划 Global Constraints 第 6 条）。
+    判定条件**只有**环境变量，且按 ``test_generation_inline`` 的严格解析口径取值：
+    ``os.getenv`` 返回字符串，``"0"``/``"false"``/``"no"`` 全为真值，直接按真值
+    判定会让 ``app/.env`` 里写 ``GENERATION_INLINE=0`` 想关闭它的人反而打开它
+    （``start_app_v2.sh`` 会把 env 文件的每一行都 export 进后端进程），生产路径
+    于是会在请求内同步等待 1~4 分钟的流水线，撞上网关 120s 代理读超时（计划
+    Global Constraints 第 6 条）。``generate`` 恒有请求会话，若把「传入了会话」
+    也当作 inline 依据，同样会踩中这个坑。
     """
-    if os.getenv("GENERATION_INLINE"):
+    if os.getenv("GENERATION_INLINE", "").strip().lower() in ("1", "true"):
         return None
 
     key = (public_id, version_seq)

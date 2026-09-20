@@ -33,6 +33,14 @@ def fake_ai(monkeypatch):
 
 
 async def test_inline_generation_reaches_succeeded(client, inline, fake_ai):
+    """版本经 steps 端点走到 ``succeeded``，本身就是「流水线写的是注入会话」的证明。
+
+    本测试环境没有 ``DATABASE_URL``，``db_manager.session()`` 开不了连接，所以若
+    流水线没有复用注入的请求会话（而是去开独立会话），三个阶段一步都写不下去，
+    版本不可能到达 ``succeeded``、``call_count`` 也不可能为 3——这两个断言合起来
+    已经覆盖了「inline 路径复用请求会话而非真实库」这一性质，无需另设只断言
+    「版本数为 1」的测试（那只反映 ``prepare()`` 早已落库，与是否复用会话无关）。
+    """
     created = await client.post("/api/v1/atoms/projects", json={"title": "T"})
     public_id = created.json()["public_id"]
 
@@ -51,16 +59,34 @@ async def test_inline_generation_reaches_succeeded(client, inline, fake_ai):
     assert fake_ai.call_count() == 3
 
 
-async def test_inline_uses_request_session_not_real_db(client, inline, fake_ai):
-    """若 inline 路径去连真实库，本测试会因 DATABASE_URL 缺失而报错。"""
+async def test_explicitly_disabled_flag_does_not_enable_inline(
+    client, fake_ai, monkeypatch
+):
+    """``GENERATION_INLINE=0`` 必须是「关闭」，而不是「开启」。
+
+    ``os.getenv`` 返回字符串，``"0"``/``"false"``/``"no"`` 全为真值——若直接按
+    真值判定，开发者在 ``app/.env`` 里写 ``GENERATION_INLINE=0`` 想关掉这个测试
+    逃生舱，反而会把它打开；而 ``start_app_v2.sh`` 会把 env 文件里的每一行
+    ``KEY=VALUE`` 都 export 进后端进程，所以生产环境同样可被这行配置踩中，
+    ``generate`` 就会在请求内 await 整条 1~4 分钟的流水线，撞上网关 120s 代理
+    读超时（计划 Global Constraints 第 6 条）。
+
+    断言方式与 ``test_env_unset_keeps_generation_out_of_the_request`` 一致：后台
+    任务必然去开独立 DB 会话（测试环境无 ``DATABASE_URL``，开不了），模型一次都
+    不会被调用；只有 inline 被真正开启时 ``call_count`` 才会是 3。
+    """
+    monkeypatch.setenv("GENERATION_INLINE", "0")
     created = await client.post("/api/v1/atoms/projects", json={"title": "T"})
     public_id = created.json()["public_id"]
-    await client.post(
+
+    accepted = await client.post(
         f"/api/v1/atoms/projects/{public_id}/generate",
         json={"prompt": "做一个计时器"},
     )
-    detail = await client.get(f"/api/v1/atoms/projects/{public_id}")
-    assert len(detail.json()["versions"]) == 1
+    assert accepted.status_code == 202
+
+    await asyncio.sleep(0.05)  # 给后台任务留出跑到失败点的时间
+    assert fake_ai.call_count() == 0
 
 
 async def test_env_unset_keeps_generation_out_of_the_request(
