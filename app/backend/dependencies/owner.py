@@ -36,6 +36,11 @@ ANON_MAX_AGE = 180 * 24 * 3600
 
 _SIG_CHARS = 16
 _NONCE_BYTES = 16
+# user: 键取 sha256 前 32 个十六进制字符（128 bit）——足够避免碰撞，且总长固定 37。
+_SUBJECT_CHARS = 32
+
+# 空密钥降级只告警一次：每请求告警会把日志刷爆。
+_warned_missing_secret = False
 
 
 def _secret() -> bytes:
@@ -44,8 +49,27 @@ def _secret() -> bytes:
     必须用 ``getattr`` 兜底：``settings.__getattr__`` 在环境变量缺失时**抛
     AttributeError** 而不是返回空串，直接取属性会让 ``JWT_SECRET_KEY`` 未配置的
     部署在每个路由上 500，与 get_owner 「密钥未配置仍按匿名身份工作」的约定冲突。
+
+    空密钥意味着匿名归属键任何人都能算出来，因此首次降级时告警一次，
+    让运维能发现，而不是无声无息地退化。
     """
-    return (getattr(settings, "jwt_secret_key", "") or "").encode("utf-8")
+    global _warned_missing_secret
+    secret = getattr(settings, "jwt_secret_key", "") or ""
+    if not secret and not _warned_missing_secret:
+        _warned_missing_secret = True
+        logger.warning("JWT 密钥未配置：匿名归属键的签名已降级为可预测值，本部署下匿名身份可被伪造，请配置 JWT_SECRET_KEY")
+    return secret.encode("utf-8")
+
+
+def _user_key(subject: str) -> str:
+    """由 sub 派生定长归属键。
+
+    必须**始终**哈希，不能只在 sub 过长时哈希：``users.id`` 是 String(255)，
+    sub 可远超 ``projects.owner_key`` 的 64 字符上限，直接拼接会让写入失败。
+    也不能截断 sub：共享长前缀的两个 sub 会塌缩成同一身份（数据泄露）。
+    哈希同时保证长度恒为 37 且两个不同 sub 得到两个不同键。
+    """
+    return f"user:{hashlib.sha256(subject.encode('utf-8')).hexdigest()[:_SUBJECT_CHARS]}"
 
 
 def _sign(nonce: str) -> str:
@@ -101,7 +125,7 @@ async def get_owner(
             payload = decode_access_token(credentials.credentials)
             subject = payload.get("sub")
             if subject:
-                return OwnerContext(owner_key=f"user:{subject}", anon_key=None)
+                return OwnerContext(owner_key=_user_key(subject), anon_key=None)
         except AccessTokenError:
             logger.debug("JWT 校验未通过，回退到匿名身份")
         except Exception as exc:  # noqa: BLE001 - 校验异常不得中断请求
