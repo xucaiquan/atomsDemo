@@ -122,13 +122,13 @@ def error_envelope(code: str, message: str, ctx: OwnerContext | None = None) -> 
 
 
 class CreateProjectRequest(BaseModel):
+    # 归属键绝不接受客户端传入：它由 get_owner 从登录凭据或服务端签名标识派生。
+    # 历史字段 owner_key 已删除——留着它等于留一条伪造归属的路（spec §2 不变量 1）。
     title: Optional[str] = None
-    owner_key: Optional[str] = None
 
 
 class GenerateRequest(BaseModel):
     prompt: str = ""
-    owner_key: Optional[str] = None
 
 
 # ------------------------------------------------------------------ 序列化工具
@@ -204,6 +204,11 @@ def _visible(stmt, owner: str):
     return stmt.where(or_(Projects.owner_key == owner, Projects.is_demo.is_(True)))
 
 
+# 演示项目对所有身份可见但**不可写**。用 409 而不是 404：演示项目在列表里本来
+# 就看得见，谎称「不存在」会让用户以为数据坏了（spec §4 S1.2）。
+DEMO_READ_ONLY_MESSAGE = "这是演示项目，仅供浏览；请点左上角「新项目」创建你自己的项目"
+
+
 async def _require_project(
     db: AsyncSession,
     public_id: str,
@@ -216,23 +221,25 @@ async def _require_project(
     查找一律经过 ``_owned`` / ``_visible``，不另拼 where。
 
     写路径先按 ``_owned`` 找本人的项目；找不到时再用 ``_visible`` 区分两种情况：
-    演示项目（所有身份可见但**不可写** → 409；演示项目在列表里本来就看得见，
-    用 404 会让人以为数据坏了）与「不存在或属于他人」（→ 404，fail-closed，
-    不泄露项目的存在性）。因此写路径的 happy case 仍然只有一条查询。
+    演示项目（所有身份可见但**不可写** → 409）与「不存在或属于他人」（→ 404，
+    fail-closed，不泄露项目的存在性）。因此写路径的 happy case 仍然只有一条查询。
+
+    ``is_demo`` 是只读的**权威**来源：即使 ``_owned`` 命中，is_demo=true 的行也
+    一律拒绝写入。只检查「命中就放行」会漏掉「既归本人又是演示项目」的行——这类
+    行被删改是全体访客共见的事故。判定复用已经取回的行，不额外查库。
     """
     base = select(Projects).where(Projects.public_id == public_id)
 
     if write:
         owned = (await db.execute(_owned(base, ctx.owner_key))).scalars().first()
         if owned is not None:
+            if owned.is_demo:
+                raise RouteError("CONFLICT", DEMO_READ_ONLY_MESSAGE)
             return owned
         visible = (await db.execute(_visible(base, ctx.owner_key))).scalars().first()
         if visible is None:
             raise RouteError("NOT_FOUND", "项目不存在或已被删除")
-        raise RouteError(
-            "CONFLICT",
-            "这是演示项目，仅供浏览；请点左上角「新项目」创建你自己的项目",
-        )
+        raise RouteError("CONFLICT", DEMO_READ_ONLY_MESSAGE)
 
     visible = (await db.execute(_visible(base, ctx.owner_key))).scalars().first()
     if visible is None:
@@ -241,18 +248,6 @@ async def _require_project(
 
 
 # ------------------------------------------------------------------ 查询工具
-
-
-async def _fetch_project(db: AsyncSession, public_id: str) -> Projects | None:
-    """**不带归属过滤**的原始查询。
-
-    对外路由的项目查找一律走 ``_require_project``：读 ``write=False``、写
-    ``write=True``。本函数只留给「归属已经由别处确立」的内部路径——目前
-    ``generate`` / ``cancel_generation`` 的调用点尚未收口（Task 5），
-    失效版本清理的语义在 Task 6。
-    """
-    result = await db.execute(select(Projects).where(Projects.public_id == public_id))
-    return result.scalars().first()
 
 
 async def _recover_stale_versions(
@@ -300,7 +295,13 @@ async def _recover_stale_versions(
                 step.status = "failed"
                 step.output = step.output or "该阶段被中断"
 
-        project = await _fetch_project(db, version.project_public_id)
+        # Task 6 会把这里换成按 ``owner`` 限定的 ``_visible``（本模块已无未过滤的
+        # 项目查询工具可用）。Task 5 的边界是「路由不再有未过滤入口」，恢复扫描
+        # 的语义归属仍在 Task 6。
+        project_result = await db.execute(
+            select(Projects).where(Projects.public_id == version.project_public_id)
+        )
+        project = project_result.scalars().first()
         if project and project.latest_status in ACTIVE_STATUSES:
             project.latest_status = "failed"
 
@@ -365,8 +366,8 @@ async def create_project(
     project = Projects(
         public_id=str(uuid.uuid4()),
         title=title,
-        # 归属键只来自服务端派生（spec §2 不变量 1）；请求体里的 owner_key
-        # 字段仍在模型上，但已不参与写入，Task 5 会把它一并删除。
+        # 归属键只来自服务端派生（spec §2 不变量 1）：请求体里的 owner_key
+        # 字段已从 CreateProjectRequest 删除，客户端再无任何置入归属的入口。
         owner_key=ctx.owner_key,
         version_count=0,
         latest_status=None,
@@ -459,7 +460,7 @@ async def get_version(
     )
     version = result.scalars().first()
     if not version:
-        return error_envelope("NOT_FOUND", "该版本不存在")
+        return error_envelope("NOT_FOUND", "该版本不存在", ctx)
 
     payload = {
         "seq": version.seq,
@@ -481,10 +482,11 @@ async def delete_project(
     ctx: OwnerContext = Depends(get_owner),
     db: AsyncSession = Depends(get_db),
 ):
-    """删除项目及其下全部版本、消息与步骤（级联）。"""
-    project = await _fetch_project(db, public_id)
-    if not project:
-        return error_envelope("NOT_FOUND", "项目不存在或已被删除")
+    """删除项目及其下全部版本、消息与步骤（级联）。仅限本人的项目。"""
+    try:
+        project = await _require_project(db, public_id, ctx, write=True)
+    except RouteError as exc:
+        return error_envelope(exc.code, exc.message, ctx)
 
     for model in (Generation_steps, Messages, Versions):
         rows = await db.execute(
@@ -494,7 +496,7 @@ async def delete_project(
             await db.delete(row)
     await db.delete(project)
     await db.commit()
-    return JSONResponse(status_code=200, content={"deleted": True})
+    return _json({"deleted": True}, ctx)
 
 
 # ------------------------------------------------------------------ 后台生成任务
@@ -652,17 +654,23 @@ async def generate(
     校验类错误在受理之前以错误信封返回（VALIDATION_ERROR / NOT_FOUND / CONFLICT）。
     """
     prompt = (data.prompt or "").strip()
+    # 校验发生在归属校验**之前**，匿名身份在这里就可能拿到响应：三条错误路径
+    # 都必须带 ctx，否则首次请求（还没有 cookie）拿不到 Set-Cookie，客户端
+    # 下一次请求就是一个全新的陌生人（模块头的单一构造路径不变量）。
     if len(prompt) < PROMPT_MIN_LEN:
-        return error_envelope("VALIDATION_ERROR", "请先描述你想要的应用，描述不能为空")
+        return error_envelope("VALIDATION_ERROR", "请先描述你想要的应用，描述不能为空", ctx)
     if len(prompt) > PROMPT_MAX_LEN:
         return error_envelope(
-            "VALIDATION_ERROR", f"描述过长，请精简到 {PROMPT_MAX_LEN} 字以内"
+            "VALIDATION_ERROR", f"描述过长，请精简到 {PROMPT_MAX_LEN} 字以内", ctx
         )
 
-    await _recover_stale_versions(db, public_id)
-    project = await _fetch_project(db, public_id)
-    if not project:
-        return error_envelope("NOT_FOUND", "项目不存在或已被删除")
+    # 三个参数缺一不可：少传 owner 会让「本项目」的清理变成全表扫描 + 可能改到
+    # 别人的版本状态（Task 6 才让 owner 真正参与过滤，签名必须现在就对）。
+    await _recover_stale_versions(db, ctx.owner_key, public_id)
+    try:
+        project = await _require_project(db, public_id, ctx, write=True)
+    except RouteError as exc:
+        return error_envelope(exc.code, exc.message, ctx)
 
     # 并发约束（FR-012）
     active = await db.execute(
@@ -672,7 +680,7 @@ async def generate(
         )
     )
     if active.scalars().first():
-        return error_envelope("CONFLICT", "该项目已有正在进行的生成，请等待完成后再试")
+        return error_envelope("CONFLICT", "该项目已有正在进行的生成，请等待完成后再试", ctx)
 
     # 迭代时回传上一版 HTML（research.md R5）
     previous_result = await db.execute(
@@ -718,12 +726,19 @@ async def generate(
             session=db,
         )
 
-    return {
-        "status": "accepted",
-        "version_seq": version_seq,
-        "steps": prepared["steps"],
-        "step_names": list(prompts.STEP_NAMES),
-    }
+    # status_code 必须显式传 202：路由装饰器上的 status_code 只在处理器返回
+    # 普通 dict 时生效，直接返回 Response 对象会以 Response 自身的状态码为准——
+    # 少传就成了 200，前端的「已受理、开始轮询」分支不再命中。
+    return _json(
+        {
+            "status": "accepted",
+            "version_seq": version_seq,
+            "steps": prepared["steps"],
+            "step_names": list(prompts.STEP_NAMES),
+        },
+        ctx,
+        status_code=202,
+    )
 
 
 @router.get("/projects/{public_id}/versions/{seq}/steps")
@@ -746,7 +761,7 @@ async def get_version_steps(
     )
     version = version_result.scalars().first()
     if not version:
-        return error_envelope("NOT_FOUND", "该版本不存在")
+        return error_envelope("NOT_FOUND", "该版本不存在", ctx)
 
     steps_result = await db.execute(
         select(Generation_steps)
@@ -793,6 +808,13 @@ async def cancel_generation(
     - 版本已是终态：返回 409，避免误取消已完成的结果。
     - 已成功的旧版本不受影响；用户输入的需求已持久化，可继续提交新要求。
     """
+    # 归属校验必须在版本查询**之前**：否则他人的项目在本函数里的第一响应会是
+    # 「该版本已结束」（409），既泄露了该项目的版本状态，也与越权矩阵的 404 契约不符。
+    try:
+        project = await _require_project(db, public_id, ctx, write=True)
+    except RouteError as exc:
+        return error_envelope(exc.code, exc.message, ctx)
+
     version_result = await db.execute(
         select(Versions).where(
             Versions.project_public_id == public_id, Versions.seq == seq
@@ -800,9 +822,9 @@ async def cancel_generation(
     )
     version = version_result.scalars().first()
     if not version:
-        return error_envelope("NOT_FOUND", "该版本不存在")
+        return error_envelope("NOT_FOUND", "该版本不存在", ctx)
     if version.status not in ACTIVE_STATUSES:
-        return error_envelope("CONFLICT", "该版本已结束，无需取消")
+        return error_envelope("CONFLICT", "该版本已结束，无需取消", ctx)
 
     version.status = "cancelled"
     version.error = "生成已取消"
@@ -820,8 +842,7 @@ async def cancel_generation(
             step.output = step.output or "已取消"
             step.ended_at = step.ended_at or now_iso
 
-    project = await _fetch_project(db, public_id)
-    if project and project.latest_status in ACTIVE_STATUSES:
+    if project.latest_status in ACTIVE_STATUSES:
         project.latest_status = "cancelled"
 
     db.add(
@@ -840,4 +861,4 @@ async def cancel_generation(
     if task and not task.done():
         task.cancel()
 
-    return {"status": "cancelled", "version_seq": seq}
+    return _json({"status": "cancelled", "version_seq": seq}, ctx)
