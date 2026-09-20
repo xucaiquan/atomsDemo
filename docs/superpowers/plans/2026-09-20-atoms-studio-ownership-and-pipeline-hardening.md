@@ -499,6 +499,8 @@ def _spawn_generation(
 
 - [ ] **Step 7: 写 inline 模式的集成测试**
 
+新建文件 `app/backend/tests/test_generation_inline.py`，内容如下：
+
 ```python
 """GENERATION_INLINE：请求内同步执行流水线，且复用请求会话。"""
 
@@ -567,8 +569,6 @@ async def test_inline_uses_request_session_not_real_db(client, inline, fake_ai):
 
 Run: `cd app/backend && python -m pytest tests/test_fake_aihub.py tests/test_generation_inline.py -q`
 Expected: `7 passed`
-
-（把 Step 7 的测试写到 `app/backend/tests/test_generation_inline.py`。）
 
 若报 `ValueError: AI service not configured`，说明 `monkeypatch.setattr` 的目标不对——`pipeline.py` 里是 `from services.aihub import AIHubService`，所以要 patch `services.pipeline.AIHubService`。
 
@@ -1649,10 +1649,11 @@ async def _recover_stale_versions(
     now = datetime.now(timezone.utc)
     changed = False
     for version in stale:
-        created = version.created_at
-        if created and created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        if created and now - created < STALE_AFTER:
+        # 时间戳口径归一（_as_utc 见 Step 3b）：朴素值按**本地时间**解释。
+        # 不能用 replace(tzinfo=utc)——那会把 UTC+8 机器上的真实年龄凭空加上
+        # 8 小时，2 小时前的版本被判成 10 小时前，正常生成会被误杀。
+        reference = _as_utc(version.created_at)
+        if reference and now - reference < STALE_AFTER:
             continue
 
         version.status = "failed"
@@ -1679,7 +1680,39 @@ async def _recover_stale_versions(
         project = project_result.scalars().first()
 ```
 
-（`created_at` 与时间戳口径的进一步修正见 Task 15，本任务只做 owner 限定。）
+- [ ] **Step 3b: 在 pipeline.py 加时间戳口径归一函数**
+
+`_recover_stale_versions` 依赖它，所以必须与它同批交付（否则本任务的
+`test_recovery_does_touch_own_stale_version` 在 UTC+8 机器上必然失败）。
+
+`app/backend/services/pipeline.py`，放在 `_iso` 之后：
+
+```python
+def _as_utc(value: datetime | None) -> datetime | None:
+    """把库里的时间戳归一成 aware-UTC。
+
+    **朴素值按本地时间解释**（``.astimezone()`` 会附上本地偏移），因为这正是
+    ``models`` 的 ``default=PyDateTime.now`` 写进去的东西。
+
+    绝不能写成 ``value.replace(tzinfo=timezone.utc)``——那等于宣称朴素值是 UTC，
+    在 UTC+8 机器上会让真实年龄凭空 +8 小时：2 小时前的正常生成被算成 10 小时前，
+    正好越过 STALE_AFTER，把活跃任务误杀。
+
+    本规则的偏差方向只会**低估**年龄（本地时钟落后 UTC 时尤其如此），因此宁可让
+    真挂死的任务多留一会儿，也绝不误杀一个其实还新鲜的版本。
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.astimezone()
+    return value.astimezone(timezone.utc)
+```
+
+`routers/atoms.py` 的 import 补上它：
+
+```python
+from services.pipeline import ACTIVE_STATUSES, FALLBACK_TITLE, GenerationPipeline, _as_utc
+```
 
 - [ ] **Step 4: 加迁移漏跑的自检日志**
 
@@ -3068,9 +3101,6 @@ async def test_stage_timeout_is_enforced(session_maker, monkeypatch):
     monkeypatch.setattr(pipeline_module, "RETRY_BACKOFF_SECONDS", (0,))
     monkeypatch.setattr(pipeline_module, "STAGE_TIMEOUT", 0.05)
 
-    async def _hang(request):
-        await asyncio.sleep(5)
-
     class _Hanging(FakeAIHub):
         async def gentxt(self, request):
             self.requests.append(request)
@@ -3533,7 +3563,7 @@ Expected: FAIL，`ImportError: cannot import name 'HEARTBEAT_INTERVAL'`
 HEARTBEAT_INTERVAL = 30.0
 ```
 
-新增两个时钟函数（放在 `_now` 之后）：
+新增时钟函数（放在 Task 6 加的 `_as_utc` 之后）：
 
 ```python
 def _orm_clock() -> datetime:
@@ -3549,18 +3579,7 @@ def _orm_clock() -> datetime:
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
-    """把库里的时间戳归一成 aware-UTC。
-
-    朴素值按**本地时间**解释（``.astimezone()`` 会附上本地偏移），因为这正是
-    ORM 的 ``PyDateTime.now`` 写进去的东西。这个规则在时区偏移的方向上只会
-    **低估**年龄，因此永远不会误杀一个其实还新鲜的版本——宁可让真挂死的任务
-    多留一会儿，也不能把正常生成判死。
-    """
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.astimezone()
-    return value.astimezone(timezone.utc)
+    """（Task 6 已添加，本任务只需确认它在；不要再定义一遍。）"""
 ```
 
 `GenerationPipeline` 新增心跳方法：
@@ -3647,9 +3666,16 @@ def _is_task_alive(public_id: str, version_seq: int) -> bool:
             continue
 ```
 
-import 区补 `from services.pipeline import ACTIVE_STATUSES, FALLBACK_TITLE, GenerationPipeline, _as_utc`。
+import 区**无需再动**——Task 6 已经把 `_as_utc` 加进 `routers/atoms.py` 的 import 了。
 
 判据从 `created_at` 换成 `updated_at`（优先），这是心跳能起作用的前提。
+Task 6 写的那两行要在本任务里改掉：
+
+```python
+        reference = _as_utc(version.updated_at) or _as_utc(version.created_at)
+```
+
+（Task 6 的版本只读 `created_at`；心跳刷新的是 `updated_at`，所以必须先看它。）
 
 - [ ] **Step 5: 运行，确认通过**
 
