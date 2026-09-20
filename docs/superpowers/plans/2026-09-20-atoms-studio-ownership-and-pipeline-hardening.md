@@ -457,15 +457,18 @@ def _spawn_generation(
     prompt: str,
     previous_html: str | None,
     history_prompts: list[str] | None,
-    session: AsyncSession | None = None,
 ) -> "asyncio.Task | None":
     """创建受跟踪的后台任务，注册到任务表以支持取消，并防止 task 被 GC 提前回收。
 
     当环境变量 GENERATION_INLINE 为真时，不创建后台任务，调用方必须 await 返回值
     （见 generate 处理器）。**仅测试用**：让集成测试是确定性的，并且让流水线复用
     测试注入的会话，而不是去连真实数据库。生产环境绝不可置位。
+
+    判定条件**只能是**环境变量。绝不能写成「传入了会话也算 inline」——``generate``
+    恒有请求会话，那样写会让生产路径在请求内同步等待 1~4 分钟的流水线，直接撞上
+    网关 120s 代理读超时，也就是本设计存在的理由（Global Constraints 第 6 条）。
     """
-    if session is not None or os.getenv("GENERATION_INLINE"):
+    if os.getenv("GENERATION_INLINE"):
         return None
 
     key = (public_id, version_seq)
@@ -483,7 +486,7 @@ def _spawn_generation(
 
 ```python
     task = _spawn_generation(
-        public_id, version_seq, prompt, previous_html, history_prompts, session=db
+        public_id, version_seq, prompt, previous_html, history_prompts
     )
     if task is None:
         # GENERATION_INLINE（仅测试）：请求内直接执行，复用请求会话。
