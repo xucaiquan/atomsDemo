@@ -14,6 +14,16 @@ StaticPool 让所有会话复用同一个连接，内存库才跨会话可见。
 
 from __future__ import annotations
 
+import os
+
+# 必须在任何 core.config 导入**之前**生效：settings.__getattr__ 是「读环境变量」，
+# 且首次读取后会把值缓存进实例 __dict__。这里没有 .env 文件，三个 JWT 变量默认都未设，
+# 而 core.auth.create_access_token 依次读取它们（secret → expire_minutes → algorithm），
+# 缺任何一个都会抛 AttributeError，任何构造登录身份的测试都会失败。
+os.environ.setdefault("JWT_SECRET_KEY", "test-secret-key-for-pytest")
+os.environ.setdefault("JWT_EXPIRE_MINUTES", "60")
+os.environ.setdefault("JWT_ALGORITHM", "HS256")
+
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
