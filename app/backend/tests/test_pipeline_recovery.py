@@ -160,8 +160,13 @@ async def test_auth_error_fails_fast_without_retry(http, inject_fake_ai):
 
 
 async def test_stage_timeout_classified_as_timeout(http, inject_fake_ai, monkeypatch):
-    """每次调用超过 STAGE_TIMEOUT → 按 timeout 分类，重试耗尽后失败。"""
+    """每次调用超过阶段上限 → 按 timeout 分类，重试耗尽后失败。
+
+    阶段 3 使用独立的 ``CODE_STAGE_TIMEOUT``（整篇 HTML 的产出耗时量级与前两
+    阶段不同），因此两个上限都要压低，否则失败发生在阶段 1 而非被测的阶段 3。
+    """
     monkeypatch.setattr(pipeline_module, "STAGE_TIMEOUT", 0.05)
+    monkeypatch.setattr(pipeline_module, "CODE_STAGE_TIMEOUT", 0.05)
 
     async def slow() -> str:
         await asyncio.sleep(5)

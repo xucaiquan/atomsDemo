@@ -96,12 +96,16 @@ class AIHubService:
             # timeout 与 STAGE_TIMEOUT 对齐，保证「单次等待」只有一个口径。
             # 延迟导入：services.pipeline 在模块级导入本模块，此处再在模块级
             # 反向导入会成环；本文件对 openai 也是同样的延迟导入写法。
-            from services.pipeline import STAGE_TIMEOUT
+            # 取各阶段上限中的**最大值**：库级 timeout 是所有阶段共用的单一
+            # 配置，若按 120s 设定，阶段 3 的合法长产出（实测 105s，放宽后允许
+            # 到 200s）会被库先行切断，流水线自有的 wait_for 再宽也没有意义。
+            # 单次调用的真实约束仍由 pipeline 按阶段施加的 wait_for 决定。
+            from services.pipeline import CODE_STAGE_TIMEOUT, STAGE_TIMEOUT
 
             self.client = AsyncOpenAI(
                 api_key=settings.app_ai_key,
                 base_url=settings.app_ai_base_url.rstrip("/"),
-                timeout=STAGE_TIMEOUT,
+                timeout=max(STAGE_TIMEOUT, CODE_STAGE_TIMEOUT),
                 # 保留一次库级重试（对连接抖动有效）。它同样受预算约束：
                 # wait_for 包在整次调用之外，库级重试不会造成预算外放大。
                 max_retries=1,

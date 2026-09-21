@@ -78,6 +78,31 @@ def test_one_stage_worst_case_fits_inside_budget():
     )
 
 
+def test_code_stage_timeout_exceeds_measured_upstream_latency():
+    """阶段 3 的等待上限必须显著高于实测产出耗时，否则健康产出被误判 timeout。
+
+    这是「阶段三总是超时」的根因：实测单次阶段 3 调用
+    计算器 105.0s、贪吃蛇 69.6s（probe_upstream.py / probe_stage3_snake.py），
+    而原先与前两阶段共用的 120s 上限只比最慢样本高 15s——需求稍复杂或上游
+    稍慢就会越线。上限必须留出足够余量，而不是紧贴实测上界。
+    """
+    measured_worst = 105.0
+    assert pipeline_module.CODE_STAGE_TIMEOUT >= measured_worst * 1.5, (
+        f"阶段 3 上限 {pipeline_module.CODE_STAGE_TIMEOUT}s 相对实测最慢 "
+        f"{measured_worst}s 余量不足"
+    )
+    assert pipeline_module.CODE_STAGE_TIMEOUT > pipeline_module.STAGE_TIMEOUT
+
+
+def test_code_stage_worst_case_fits_inside_budget():
+    """放宽后的阶段 3 最坏耗时仍须被总预算兜住（首轮 + 一次续写/重跑）。"""
+    worst = 2 * pipeline_module.CODE_STAGE_TIMEOUT
+    assert worst <= pipeline_module.GENERATION_BUDGET_SECONDS, (
+        f"阶段 3 最坏 {worst}s 超出总预算 "
+        f"{pipeline_module.GENERATION_BUDGET_SECONDS}s"
+    )
+
+
 def test_budget_shorter_than_stale_recovery():
     """420 < 600：活任务的最长静默期必须短于回收阈值。
 
@@ -150,9 +175,11 @@ def test_upstream_client_declares_its_own_wait_limit(monkeypatch):
     assert service.client is not None, (
         "客户端未构造——环境变量未生效，是测试自身的问题"
     )
-    assert service.client.timeout == pipeline_module.STAGE_TIMEOUT, (
-        f"上游客户端等待上限为 {service.client.timeout!r}，未与 STAGE_TIMEOUT "
-        f"({pipeline_module.STAGE_TIMEOUT}s) 对齐"
+    assert service.client.timeout == max(
+        pipeline_module.STAGE_TIMEOUT, pipeline_module.CODE_STAGE_TIMEOUT
+    ), (
+        f"上游客户端等待上限为 {service.client.timeout!r}，未与各阶段上限的最大值对齐；"
+        "若按较小的 STAGE_TIMEOUT 设定，阶段 3 的合法长产出会被库先行切断"
     )
     assert service.client.max_retries == 1, (
         f"库级重试次数为 {service.client.max_retries!r}，会与自有重试叠加放大等待"

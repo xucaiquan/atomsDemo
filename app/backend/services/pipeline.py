@@ -64,7 +64,8 @@ _DOC_RESTART_PATTERN = re.compile(r"<!DOCTYPE\s+html|<html[\s>]", re.IGNORECASE)
 # 时间预算。四者必须严格有序（不变量见
 # uploads/specs/002-harden-increment-session/contracts/generation-lifecycle.md）：
 #
-#   STAGE_TIMEOUT(120s) < GENERATION_BUDGET_SECONDS(420s)
+#   STAGE_TIMEOUT(120s) < CODE_STAGE_TIMEOUT(200s)
+#                       < GENERATION_BUDGET_SECONDS(420s)
 #                       < STALE_AFTER(600s) < 前端轮询上限(720s)
 #
 # - 120 < 420：单次调用必须能在总预算内跑完一次并留有恢复余地，否则预算被
@@ -76,6 +77,25 @@ _DOC_RESTART_PATTERN = re.compile(r"<!DOCTYPE\s+html|<html[\s>]", re.IGNORECASE)
 # STAGE_TIMEOUT 另受上游行为约束：实测上游网关在 126.2s 处返回 524，
 # 单次等待设在其内侧，避免为一个已被上游丢弃的请求白等 114s。
 STAGE_TIMEOUT = 120.0
+# 阶段 3（代码生成）单独放宽的等待上限。
+#
+# 为什么必须区分：120s 是按**前两阶段**的产出规模定的——它们只吐几百 token 的
+# JSON，实测 7～8s 完成，120s 绰绰有余。但阶段 3 要一次性吐出整篇可运行 HTML，
+# 实测（probe_upstream.py / probe_stage3_snake.py）：
+#
+#   计算器      105.0s   ← 距 120s 只剩 15s
+#   贪吃蛇       69.6s
+#
+# 也就是说 120s 并非「上游坏了」的阈值，而是正常产出耗时的**紧邻上界**：上游
+# 只要稍慢或需求稍复杂（更多按键、更多游戏状态、更长样式表），就会在完全健康
+# 的情况下被我们自己的 wait_for 砍断，报成 timeout。这正是「阶段三总是超时」
+# 的直接原因。
+#
+# 取 200s 的依据是预算不变量，而非拍脑袋：
+#   CODE_STAGE_TIMEOUT(200s) × 2（首轮 + 一次续写/重跑）= 400s
+#                                                      < GENERATION_BUDGET_SECONDS(420s)
+# 即放宽后最坏情形仍被总预算兜住，420 < 600(STALE_AFTER) 的下游不变量不受影响。
+CODE_STAGE_TIMEOUT = 200.0
 # 整条流水线（阶段 1+2+3 及其全部重试、续写、重跑）从起点到终态的总预算。
 # 修复前的漏洞：6 次 _call_step × 每次最坏 3×240s+退避 = 4329s ≈ 72 分钟，
 # 而前端只等 12 分钟。预算必须**整体**生效而非逐次生效。
@@ -773,8 +793,11 @@ class GenerationPipeline:
             # 单次等待取「阶段上限」与「剩余预算」的较小者；下限保底
             # MIN_CALL_BUDGET_SECONDS，避免剩余预算归零时 wait_for(0) 立刻
             # 空转超时、把预算耗尽误报成上游 timeout。
+            # 阶段 3 产出整篇 HTML，耗时量级与前两阶段（几百 token 的 JSON）
+            # 完全不同，必须用各自的上限，否则健康产出会被误判为 timeout。
+            stage_limit = CODE_STAGE_TIMEOUT if step_seq == 3 else STAGE_TIMEOUT
             timeout = min(
-                STAGE_TIMEOUT, max(self._remaining(), MIN_CALL_BUDGET_SECONDS)
+                stage_limit, max(self._remaining(), MIN_CALL_BUDGET_SECONDS)
             )
             try:
                 response = await asyncio.wait_for(
