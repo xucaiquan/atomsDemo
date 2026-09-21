@@ -17,6 +17,7 @@ logs/
 .env.development
 env/
 venv/
+.venv/
 ENV/
 .DS_Store
 .idea/
@@ -56,3 +57,9 @@ test-results/
 pnpm-lock.yaml
 *.pyc
 __pycache__
+
+# 复核期间的探针调试转储（原始 API 响应，不入库）
+app/backend/_*.json
+
+# Claude Code 本地设置（本地文件，不入库）
+.claude/settings.local.json

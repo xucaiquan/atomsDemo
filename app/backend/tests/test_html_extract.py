@@ -11,8 +11,10 @@ from __future__ import annotations
 from services.html_extract import (
     CSP_META_TAG,
     extract_html,
+    has_duplicate_structure,
     inject_csp,
     is_complete_document,
+    looks_well_formed,
     sanitize_generated_html,
 )
 
@@ -126,3 +128,42 @@ def test_sanitize_rejects_empty_input():
     html, error = sanitize_generated_html("")
     assert html == ""
     assert error is not None
+
+
+# ---------------------------------------------------- 结构完整性（S3.4）
+#
+# is_complete_document 只看结尾，续写拼接把模型「重开的整篇文档」接在原稿后面时，
+# 末尾同样是 </html>，仅靠结尾判定会漏判成脏数据。
+
+
+def test_looks_well_formed_accepts_single_structure():
+    assert looks_well_formed(FULL_DOC)
+    assert looks_well_formed(FULL_DOC + "\n\n")
+
+
+def test_looks_well_formed_rejects_duplicate_html():
+    doubled = FULL_DOC + "\n" + FULL_DOC
+    assert is_complete_document(doubled)  # 结尾判定会漏判
+    assert not looks_well_formed(doubled)
+    assert has_duplicate_structure(doubled)
+
+
+def test_looks_well_formed_rejects_duplicate_body_only():
+    doc = "<!DOCTYPE html><html><body><p>a</p></body><body><p>b</p></body></html>"
+    assert not looks_well_formed(doc)
+    assert has_duplicate_structure(doc)
+
+
+def test_looks_well_formed_rejects_truncated():
+    assert not looks_well_formed("<!DOCTYPE html><html><body>半截")
+    assert not looks_well_formed("")
+    assert not looks_well_formed(None)
+
+
+def test_looks_well_formed_ignores_js_string_literals():
+    """正文里出现 '<html' 字面量（如模板字符串）不误判为重复结构。"""
+    doc = (
+        "<!DOCTYPE html>\n<html>\n<head><title>t</title></head>\n"
+        "<body><script>var s = '&lt;html&gt; 转义示例';</script></body>\n</html>"
+    )
+    assert looks_well_formed(doc)

@@ -30,6 +30,7 @@ _FENCE_PATTERN = re.compile(
 _DOCTYPE_PATTERN = re.compile(r"<!DOCTYPE\s+html", re.IGNORECASE)
 _HTML_OPEN_PATTERN = re.compile(r"<html[\s>]", re.IGNORECASE)
 _HEAD_OPEN_PATTERN = re.compile(r"<head[^>]*>", re.IGNORECASE)
+_BODY_OPEN_PATTERN = re.compile(r"<body[\s>]", re.IGNORECASE)
 _EXISTING_CSP_PATTERN = re.compile(
     r"<meta[^>]+http-equiv\s*=\s*[\"']?content-security-policy",
     re.IGNORECASE,
@@ -86,6 +87,38 @@ def is_complete_document(html: str | None) -> bool:
     if not html:
         return False
     return html.rstrip().lower().endswith("</html>")
+
+
+def looks_well_formed(doc: str | None) -> bool:
+    """结构完整性校验（设计文档 S3.4），比「以 </html> 结尾」更严格。
+
+    判定条件：① 以 ``</html>`` 结尾；② ``<!DOCTYPE`` 至多 1 个；
+    ③ ``<html`` 恰好 1 个；④ ``<body`` 恰好 1 个。
+
+    用编译好的开标签正则计数，``</html>`` / ``</body>`` 不会被误计入。
+    续写拼接若把模型「重开的整篇文档」接在原稿后面，会出现两份结构——
+    此时末尾恰好也是 ``</html>``，仅靠 is_complete_document 会漏判成脏数据。
+    """
+    if not is_complete_document(doc):
+        return False
+    text = doc or ""
+    if len(_DOCTYPE_PATTERN.findall(text)) > 1:
+        return False
+    if len(_HTML_OPEN_PATTERN.findall(text)) != 1:
+        return False
+    if len(_BODY_OPEN_PATTERN.findall(text)) != 1:
+        return False
+    return True
+
+
+def has_duplicate_structure(doc: str | None) -> bool:
+    """文档标记是否重复（模型续写时重开了整篇文档的信号，S3.4）。"""
+    text = doc or ""
+    return (
+        len(_DOCTYPE_PATTERN.findall(text)) > 1
+        or len(_HTML_OPEN_PATTERN.findall(text)) > 1
+        or len(_BODY_OPEN_PATTERN.findall(text)) > 1
+    )
 
 
 def inject_csp(html: str | None) -> str:

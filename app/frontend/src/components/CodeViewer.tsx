@@ -1,14 +1,21 @@
 /**
- * CodeViewer —— 只读源代码视图（FR-009 / T033）。
+ * CodeViewer —— 只读源代码视图（FR-009 / T033 / S5.2）。
  *
  * 规格原计划使用 Monaco；为控制产物体积与加载性能，这里用带行号与语法着色的
  * 轻量只读视图实现同等能力（查看源代码），并提供复制。
+ *
+ * 工具条展示当前版本号、大小与后端计算的 SHA-256（与预览工具条同源同值），
+ * 用于核验「预览所见 == 源码所存」。
  */
 import { useMemo, useState } from 'react';
 import { Check, Copy } from 'lucide-react';
 
 interface CodeViewerProps {
   html: string;
+  /** 当前展示的版本号。 */
+  seq?: number | null;
+  /** 后端对存储 HTML 计算的 sha256（S5.2）。 */
+  sha256?: string;
 }
 
 const KEYWORD_RE =
@@ -34,8 +41,9 @@ function highlight(line: string): string {
   );
 }
 
-export default function CodeViewer({ html }: CodeViewerProps) {
+export default function CodeViewer({ html, seq, sha256 }: CodeViewerProps) {
   const [copied, setCopied] = useState(false);
+  const [shaCopied, setShaCopied] = useState(false);
   const lines = useMemo(() => (html ? html.split('\n') : []), [html]);
 
   const handleCopy = async () => {
@@ -45,6 +53,17 @@ export default function CodeViewer({ html }: CodeViewerProps) {
       setTimeout(() => setCopied(false), 1600);
     } catch {
       setCopied(false);
+    }
+  };
+
+  const handleCopySha = async () => {
+    if (!sha256) return;
+    try {
+      await navigator.clipboard.writeText(sha256);
+      setShaCopied(true);
+      setTimeout(() => setShaCopied(false), 1600);
+    } catch {
+      setShaCopied(false);
     }
   };
 
@@ -58,13 +77,26 @@ export default function CodeViewer({ html }: CodeViewerProps) {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex shrink-0 items-center justify-between border-b border-slate-800 bg-slate-900/60 px-4 py-2">
-        <span className="text-[11px] text-slate-400">
-          index.html · {lines.length} 行 · {(html.length / 1024).toFixed(1)} KB
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-slate-800 bg-slate-900/60 px-4 py-2">
+        <span className="flex min-w-0 flex-wrap items-center gap-2 text-[11px] text-slate-400">
+          <span>
+            index.html{seq != null ? ` · v${seq}` : ''} · {lines.length} 行 ·{' '}
+            {(html.length / 1024).toFixed(1)} KB
+          </span>
+          {sha256 && (
+            <button
+              type="button"
+              onClick={() => void handleCopySha()}
+              title="点击复制完整 SHA-256（与预览同一版本内容哈希）"
+              className="truncate rounded border border-slate-700 bg-slate-950/60 px-1.5 py-0.5 font-mono text-[10px] text-slate-500 transition-colors hover:border-sky-500/50 hover:text-sky-300"
+            >
+              SHA-256 {shaCopied ? '已复制 ✓' : sha256.slice(0, 16)}…
+            </button>
+          )}
         </span>
         <button
           type="button"
-          onClick={handleCopy}
+          onClick={() => void handleCopy()}
           className="flex items-center gap-1 rounded-md border border-slate-700 px-2 py-1 text-[11px] text-slate-300 transition-colors hover:border-sky-500/50 hover:text-sky-300"
         >
           {copied ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
