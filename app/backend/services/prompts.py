@@ -31,6 +31,13 @@ HISTORY_MAX_ITEMS = 6
 HISTORY_ITEM_CHARS = 400
 HISTORY_LATEST_ITEM_CHARS = 600
 
+# 非成功轮次在历史里的状态标注。必须显式写出「未产出页面」——否则模型会把
+# 那一轮当成已经做好的功能，在不存在的产物上「继续叠加」。
+HISTORY_STATUS_MARKS = {
+    "failed": "（该轮生成失败，未产出页面）",
+    "cancelled": "（该轮被用户中止，未产出页面）",
+}
+
 # 上下文预算（设计文档 2026-09-20 S3.3）：注入上一版 HTML 与续写历史的上限，
 # 防止迭代轮次把 prompt 撑爆导致截断或超时。
 PREVIOUS_HTML_MAX_CHARS = 24_000
@@ -39,21 +46,41 @@ CONTINUE_HISTORY_MAX_CHARS = 12_000
 _PREVIOUS_HTML_TAIL_CHARS = 2_000
 
 
-def build_history_block(history_prompts: list[str] | None) -> str:
+def build_history_block(history_prompts: list | None) -> str:
     """把本项目此前各版本的需求拼成「需求历史」上下文块。
 
     用于让模型理解「继续刚刚的需求」「按之前说的」「再优化一下」这类
     引用上文的指令——否则模型只看到孤立的当前短句，无法还原真实意图。
     「最新一条」= 切片最后一个元素，即时间上最靠后、当轮指代最可能指向的需求。
+
+    条目可为 ``str``（视为成功轮次）或 ``(prompt, status)`` 二元组。
+    **失败/取消轮次必须进入历史并带状态标注**：这是「第一轮贪吃蛇失败 →
+    第二轮说『重新执行』」这一真实场景的唯一依据。若把失败轮次整条剔除，
+    历史为空，模型只看到孤立的「重新执行」，会把它当成一个全新需求去理解
+    （实测被理解成「任务重做清单」）。标注状态则既保住了指代对象，又明确
+    告诉模型那一轮没有产物、应当重做而非在其上叠加。
+
+    注意：**增量基线（previous_html）仍只取成功版本**（FR-002），失败轮次
+    只进入「需求历史」这一文本上下文，不会成为改写基线。
     """
-    cleaned = [p.strip() for p in (history_prompts or []) if p and p.strip()]
-    if not cleaned:
+    items: list[tuple[str, str]] = []
+    for entry in history_prompts or []:
+        if isinstance(entry, (tuple, list)):
+            text, status = (entry + ("succeeded",))[:2] if isinstance(entry, tuple) else (entry[0], entry[1])
+        else:
+            text, status = entry, "succeeded"
+        text = (text or "").strip()
+        if text:
+            items.append((text, status or "succeeded"))
+    if not items:
         return ""
-    recent = cleaned[-HISTORY_MAX_ITEMS:]
-    lines = [
-        f"{i}. {item[:HISTORY_LATEST_ITEM_CHARS if i == len(recent) else HISTORY_ITEM_CHARS]}"
-        for i, item in enumerate(recent, start=1)
-    ]
+    recent = items[-HISTORY_MAX_ITEMS:]
+
+    lines = []
+    for i, (text, status) in enumerate(recent, start=1):
+        limit = HISTORY_LATEST_ITEM_CHARS if i == len(recent) else HISTORY_ITEM_CHARS
+        mark = HISTORY_STATUS_MARKS.get(status, "")
+        lines.append(f"{i}. {text[:limit]}{mark}")
     return (
         "【本项目此前的需求历史（按时间先后，越靠后越新）】\n"
         + "\n".join(lines)
@@ -100,8 +127,12 @@ def truncate_continue_history(doc: str) -> str:
 
 ANAPHORA_HINT = (
     "重要：如果本次要求引用了上下文（如「继续」「刚才」「上面」「之前说的」"
-    "「按原来的」「再优化一下」等指代），请结合上面的需求历史理解它的真实含义，"
-    "把它当作对既有应用的延续或改进，而不是一个孤立、无法执行的新需求。\n\n"
+    "「按原来的」「重新执行」「再试一次」「再优化一下」等指代），请结合上面的需求历史"
+    "理解它的真实含义，把它当作对既有应用的延续、重做或改进，而不是一个孤立、"
+    "无法执行的新需求。\n"
+    "特别注意：历史中标注「该轮生成失败，未产出页面」或「该轮被用户中止，未产出页面」的条目，"
+    "表示那一轮**没有留下任何可用产物**。若本次要求是「重新执行」「再试一次」这类指代，"
+    "请按那一轮的原始需求**从头完整实现**，不要把它理解成一个关于「重做/重试」本身的新应用。\n\n"
 )
 
 

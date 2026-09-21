@@ -66,32 +66,45 @@ async def test_second_round_sees_history_and_previous_html(client, inject_fake_a
     assert "计算器v2" in detail["html"]
 
 
-async def test_failed_round_prompt_not_in_history(client, inject_fake_ai):
-    """失败轮次的需求不得污染后续轮次的需求历史（S1.2）。"""
+async def test_failed_round_enters_history_but_never_becomes_baseline(
+    client, inject_fake_ai
+):
+    """失败轮次**带状态标注进入历史**，但绝不成为增量基线。
+
+    这条测试的断言方向与早期实现相反，原因是真实缺陷：早期「只取 succeeded」
+    把失败轮次整条剔除，于是「第一轮做贪吃蛇失败 → 第二轮说『重新执行』」时
+    历史为空，模型只看到孤立的「重新执行」，实测被理解成「做一个任务重做清单」。
+
+    修正后的两条不变量在此同时锁定：
+    ① 失败轮次的需求**在**历史里（否则指代无对象）；
+    ② 它带「未产出页面」标注，且 previous_html 仍是最近一个成功版本（FR-002）。
+    """
     pid = await _create_project(client)
 
     inject_fake_ai(FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, make_html("v1")]))
     await _generate(client, pid, "做一个番茄钟")
 
-    # 第二轮：鉴权失败（不重试），需求「失败的指令」不应进入历史
     inject_fake_ai(
         FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, PermissionDeniedError("403")])
     )
-    second = await _generate(client, pid, "失败的指令")
+    second = await _generate(client, pid, "做一个贪吃蛇小游戏")
     assert second.json()["version_seq"] == 2
     detail = (
         await client.get(f"/api/v1/atoms/projects/{pid}/versions/2")
     ).json()
     assert detail["status"] == "failed"
+    assert not detail["html"], "前置条件：失败轮次没有产物"
 
     fake3 = inject_fake_ai(FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, make_html("v3")]))
-    third = await _generate(client, pid, "再加一个统计图")
+    third = await _generate(client, pid, "重新执行")
     assert third.json()["version_seq"] == 3
 
-    history_msgs = fake3.user_messages()
-    assert all("做一个番茄钟" in m for m in history_msgs)   # 成功轮次在历史里
-    assert all("失败的指令" not in m for m in history_msgs)  # 失败轮次被排除
-    # 基线仍是 v1（失败版本不成为 previous_html）
+    for msg in fake3.user_messages():
+        assert "做一个番茄钟" in msg          # 成功轮次在历史里
+        assert "做一个贪吃蛇小游戏" in msg    # 失败轮次**也**在历史里（指代对象）
+        assert prompts.HISTORY_STATUS_MARKS["failed"] in msg  # 且标注「未产出页面」
+
+    # 基线仍是 v1：失败轮次只进入文本上下文，不参与增量改写
     code_msg = fake3.code_stage_messages()[0]
     assert "v1" in code_msg and "v2" not in code_msg
 
@@ -147,7 +160,14 @@ async def test_baseline_is_round1_output_when_round2_failed(client, inject_fake_
     code_msg = fake3.code_stage_messages()[0]
     assert "上一版页面的完整源码" in code_msg
     assert "基线v1" in code_msg, "基线必须是第 1 轮的产出"
-    assert "这一轮会失败" not in code_msg, "失败轮次的需求不得进入历史"
+    # 失败轮次的需求**允许**出现在需求历史里（带「未产出页面」标注，供指代消解），
+    # 但它绝不能作为增量基线出现在「上一版页面的完整源码」段落中。
+    # 这里按位置断言，而不是全文断言，避免与历史记忆修复相互矛盾。
+    baseline_section = code_msg.split("上一版页面的完整源码", 1)[1]
+    assert "这一轮会失败" not in baseline_section, "失败轮次不得成为增量基线"
+    assert prompts.HISTORY_STATUS_MARKS["failed"] in code_msg, (
+        "失败轮次进入历史时必须带「未产出页面」标注"
+    )
     assert "再加一个历史记录面板" in code_msg  # 本次需求与基线同时在场
 
 

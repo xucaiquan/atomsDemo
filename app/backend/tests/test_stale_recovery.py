@@ -27,8 +27,15 @@ from services.pipeline import GenerationPipeline
 
 
 def _naive_utc_ago(seconds: float) -> datetime:
-    """SQLite 取回为 naive datetime；写入侧统一用 naive-UTC 保证可比。"""
-    return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=seconds)
+    """构造「若干秒前」的 naive 时间戳，口径与生产写入**一致**。
+
+    关键：模型里 ``created_at`` / ``updated_at`` 的默认值是 ``datetime.now``
+    （本地时间，naive），所以真实落库的 naive 时间戳是**本地时间**而非 UTC。
+    此前这里用 naive-UTC 播种，在 UTC-7 的运行环境下与生产差 7 小时——测试
+    自己造了一份现实中不存在的数据，既可能掩盖也可能伪造 stale 判定。改用
+    ``datetime.now()`` 保持与写入侧同口径。
+    """
+    return datetime.now() - timedelta(seconds=seconds)
 
 
 async def _seed_running_version(pid: str, seconds_ago: float) -> None:

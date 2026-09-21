@@ -296,8 +296,17 @@ async def _recover_stale_versions(
     for version in stale:
         stamp = version.updated_at or version.created_at
         if stamp and stamp.tzinfo is None:
-            stamp = stamp.replace(tzinfo=timezone.utc)
-        if stamp and now - stamp < STALE_AFTER:
+            # naive 时间戳来自数据库默认值，写入的是**本地时间**，不是 UTC。
+            # 此前一律 replace(tzinfo=utc) 是错的：在 UTC-7 的运行环境下，它把
+            # 刚写入的时间戳解释成 7 小时前，任何活着的生成一经轮询就被判为
+            # 「静默超过 10 分钟」，当场改写成 failed/interrupted——表现为
+            # 「刚点生成就说被中断」。astimezone() 按运行时本地时区正确附加
+            # 偏移，使两端都是真正的绝对时刻，判据才成立。
+            stamp = stamp.astimezone()
+        # 时间戳缺失时**保守放过**：判据是「静默超过 STALE_AFTER」，而时间戳
+        # 为空只说明「无从判断静默多久」，不等于「已经中断」。宁可漏收也不可
+        # 误杀：真正中断的版本会在后续推进中带上时间戳，再由本函数正常回收。
+        if not stamp or now - stamp < STALE_AFTER:
             continue
 
         version.status = "failed"
@@ -756,20 +765,30 @@ async def generate(
     previous = previous_result.scalars().first()
     previous_html = previous.html if previous else None
 
-    # 需求历史：本项目此前**成功版本**的原始需求（时间升序）。失败/取消轮次
-    # 不入历史（设计文档 S1.2：避免污染指代消解）。用于让模型消解
-    # 「继续刚刚的需求」「按之前说的」「再优化一下」这类指代——否则模型只
-    # 看到孤立的当前短句，无法还原真实意图。条数与长度由 prompts 层截断，
-    # 上下文不会随轮次线性膨胀。必须在 prepare 落库新版本之前查询。
+    # 需求历史：本项目此前**全部已结束轮次**的原始需求（时间升序），每条附带
+    # 状态。用于让模型消解「继续刚刚的需求」「重新执行」「按之前说的」这类指代。
+    #
+    # 为什么失败/取消轮次也要入历史（修正此前「只取 succeeded」的做法）：
+    # 真实场景是「第一轮做贪吃蛇失败 → 第二轮说『重新执行』」。若失败轮次被
+    # 整条剔除，历史为空，模型只看到孤立的「重新执行」，无从知道要重做什么，
+    # 实测被误解成「做一个任务重做清单」。带状态标注入历史后，模型既拿得到
+    # 指代对象（贪吃蛇），也知道那一轮没有产物、应当重做而非叠加。
+    #
+    # 不变量 2 不受影响：增量基线 previous_html 仍只取最新 succeeded 版本
+    # （见上方查询），失败轮次只进入文本上下文，不会成为改写基线。
+    # 条数与长度由 prompts 层截断，上下文不随轮次线性膨胀。
+    # 必须在 prepare 落库新版本之前查询。
     history_result = await db.execute(
-        select(Versions.prompt)
+        select(Versions.prompt, Versions.status)
         .where(
             Versions.project_public_id == public_id,
-            Versions.status == "succeeded",
+            Versions.status.in_(("succeeded", "failed", "cancelled")),
         )
         .order_by(Versions.seq)
     )
-    history_prompts = [row for row in history_result.scalars().all() if row]
+    history_prompts = [
+        (row.prompt, row.status) for row in history_result.all() if row.prompt
+    ]
 
     pipeline = GenerationPipeline(db)
     prepared = await pipeline.prepare(project, prompt)

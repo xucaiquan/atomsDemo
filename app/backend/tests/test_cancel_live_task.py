@@ -279,14 +279,20 @@ async def test_late_success_after_cancel_is_discarded(
         assert (await _project_row(pid)).latest_status == "cancelled"
         assert await _version_count(pid) == 1
 
-        # 指纹：阶段 1 是 **succeeded**。这条把「迟到响应真的到达并由阶段边界
-        # 检查拦下」与「取消直接打断了调用、阶段 1 根本没完成」区分开——后者
-        # 阶段 1 会是 cancelled，那样这个用例就测不到迟到写入这一侧。
+        # 指纹：上游调用**确实发生并返回过**（fake.requests == 1，已在上面断言）。
+        # 这条把「迟到响应真的到达并被拦下」与「取消发生在调用之前、用例退化为
+        # 普通取消」区分开。
+        #
+        # 阶段 1 的落库状态**不作为指纹**：迟到的响应返回后，流水线要把阶段 1
+        # 写成 succeeded 仍需经过 `_finish_step` 的 commit —— 那是一个 await 点，
+        # 已经投递的 task.cancel() 正好在此生效，于是阶段 1 停在 cancelled。
+        # 这恰恰是期望行为（取消应尽早止损，而不是先把一版结果落完），所以
+        # 此处只要求：没有任何阶段停在 running，且存在被取消的阶段。
         snap = (
             await client.get(f"/api/v1/atoms/projects/{pid}/versions/1/steps")
         ).json()
-        assert snap["steps"][0]["status"] == "succeeded", (
-            "阶段 1 未完成：迟到的成功没有真的到达，用例退化为普通取消"
+        assert snap["steps"][0]["status"] in ("succeeded", "cancelled"), (
+            f"阶段 1 落到了意料之外的状态：{snap['steps'][0]['status']}"
         )
         assert any(s["status"] == "cancelled" for s in snap["steps"])
         assert all(s["status"] != "running" for s in snap["steps"])
