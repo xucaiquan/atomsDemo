@@ -98,7 +98,9 @@ def test_code_user_contains_history_hint_and_previous_html():
     assert "需求历史" in msg
     assert "贪吃蛇游戏" in msg and "计分板" in msg
     assert "OLD-CALCULATOR-MARKER" in msg  # 上一版源码回传
-    assert "保留已有功能" in msg
+    # 措辞升级：原先只有一句「保留已有功能」，实测不足以阻止模型改写旧按钮文案，
+    # 现改为注入成块的硬性保留约束（见 test_two_round_increment 的退化用例）。
+    assert prompts.INCREMENT_PRESERVE_RULES in msg
     assert msg.rstrip().endswith("现在请输出完整的 HTML 源码。")
 
 

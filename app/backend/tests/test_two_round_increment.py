@@ -31,6 +31,38 @@ async def _generate(client, pid: str, prompt: str):
     )
 
 
+async def test_increment_code_prompt_carries_preserve_rules(client, inject_fake_ai):
+    """第二轮阶段三必须携带「硬性保留约束」。
+
+    线上实测暴露过的真实退化：第二轮只被要求「加一个不感兴趣按钮」，模型却顺手
+    把上一版的「换一首」改成「换一批」、删掉「复制推荐文案」——即新功能加上了，
+    旧功能悄悄没了。仅说一句「保留已有功能」不足以约束，故显式注入逐字不改文案、
+    禁止以优化为名删改的规则，并在此锁定它确实进入了代码生成阶段的提示词。
+    """
+    pid = await _create_project(client)
+
+    inject_fake_ai(FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, make_html("歌曲推荐v1")]))
+    assert (await _generate(client, pid, "帮我创建一个每日歌曲推荐")).status_code == 202
+
+    fake2 = inject_fake_ai(FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, make_html("歌曲推荐v2")]))
+    assert (await _generate(client, pid, "每首歌下面加一个不感兴趣按钮")).status_code == 202
+
+    code_msg = fake2.user_messages()[-1]
+    assert prompts.INCREMENT_PRESERVE_RULES in code_msg
+    # 第一轮（无基线）不应出现该约束，避免凭空要求「保留」一个不存在的版本
+    assert "歌曲推荐v1" in code_msg
+
+
+async def test_first_round_has_no_preserve_rules(client, inject_fake_ai):
+    """首轮没有上一版产物，不得注入保留约束（无物可保留）。"""
+    pid = await _create_project(client)
+    fake = inject_fake_ai(FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, make_html("v1")]))
+    assert (await _generate(client, pid, "帮我创建一个每日歌曲推荐")).status_code == 202
+
+    for msg in fake.user_messages():
+        assert prompts.INCREMENT_PRESERVE_RULES not in msg
+
+
 async def test_second_round_sees_history_and_previous_html(client, inject_fake_ai):
     pid = await _create_project(client)
 
