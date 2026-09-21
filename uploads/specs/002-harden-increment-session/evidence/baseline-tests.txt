@@ -1,0 +1,280 @@
+EE....................FFFF...........................F.F.......F..F..... [ 72%]
+............................                                             [100%]
+==================================== ERRORS ====================================
+_______________ ERROR at setup of test_sqlite_can_create_tables ________________
+file /workspace/app/backend/tests/test_conftest_smoke.py, line 13
+  async def test_sqlite_can_create_tables(session_maker):
+      async with session_maker() as session:
+          result = await session.execute(select(Projects))
+          assert list(result.scalars().all()) == []
+E       fixture 'session_maker' not found
+>       available fixtures: _asyncio_loop_factory, _class_scoped_runner, _function_scoped_runner, _module_scoped_runner, _package_scoped_runner, _session_scoped_runner, anyio_backend, anyio_backend_name, anyio_backend_options, app, cache, capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, class_mocker, client, cov, db_session, doctest_namespace, engine, event_loop_policy, extra, extras, fast_backoff, free_tcp_port, free_tcp_port_factory, free_udp_port, free_udp_port_factory, http, include_metadata_in_junit_xml, inject_fake_ai, metadata, mocker, module_mocker, monkeypatch, no_cover, package_mocker, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, session_mocker, shared_session_maker, subtests, testrun_uid, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory, unused_tcp_port, unused_tcp_port_factory, unused_udp_port, unused_udp_port_factory, worker_id
+>       use 'pytest --fixtures [testpath]' for help on them.
+
+/workspace/app/backend/tests/test_conftest_smoke.py:13
+__________ ERROR at setup of test_json_roundtrip_with_timezone_column __________
+file /workspace/app/backend/tests/test_conftest_smoke.py, line 19
+  async def test_json_roundtrip_with_timezone_column(session_maker):
+      """versions.updated_at 是 DateTime(timezone=True)，确认可写可读。"""
+      from datetime import datetime
+
+      from models.versions import Versions
+
+      async with session_maker() as session:
+          version = Versions(
+              project_public_id="11111111-1111-4111-8111-111111111111",
+              seq=1,
+              prompt="测试",
+              status="pending",
+          )
+          session.add(version)
+          await session.commit()
+
+      async with session_maker() as session:
+          result = await session.execute(select(Versions))
+          loaded = result.scalars().first()
+          assert loaded is not None
+          assert loaded.created_at is not None
+          assert isinstance(loaded.created_at, datetime)
+E       fixture 'session_maker' not found
+>       available fixtures: _asyncio_loop_factory, _class_scoped_runner, _function_scoped_runner, _module_scoped_runner, _package_scoped_runner, _session_scoped_runner, anyio_backend, anyio_backend_name, anyio_backend_options, app, cache, capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, class_mocker, client, cov, db_session, doctest_namespace, engine, event_loop_policy, extra, extras, fast_backoff, free_tcp_port, free_tcp_port_factory, free_udp_port, free_udp_port_factory, http, include_metadata_in_junit_xml, inject_fake_ai, metadata, mocker, module_mocker, monkeypatch, no_cover, package_mocker, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, session_mocker, shared_session_maker, subtests, testrun_uid, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory, unused_tcp_port, unused_tcp_port_factory, unused_udp_port, unused_udp_port_factory, worker_id
+>       use 'pytest --fixtures [testpath]' for help on them.
+
+/workspace/app/backend/tests/test_conftest_smoke.py:19
+=================================== FAILURES ===================================
+________________ test_exhausted_script_returns_empty_not_error _________________
+
+    async def test_exhausted_script_returns_empty_not_error():
+        """脚本用完后返回空内容（而不是抛异常），模拟「模型返回空」。"""
+        fake = FakeAIHub([])
+>       assert (await fake.gentxt(_request())).content == ""
+
+tests/test_fake_aihub.py:50: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <tests.fakes.FakeAIHub object at 0x7fe99d71d420>
+request = GenTxtRequest(messages=[ChatMessage(role='user', content='hi')], model='test-model', stream=False, temperature=0.7, max_tokens=128)
+
+    async def gentxt(self, request: GenTxtRequest) -> GenTxtResponse:
+        self.requests.append(request)
+        if not self._script:
+>           raise AssertionError("FakeAIHub 脚本已耗尽，但流水线仍在发起调用")
+E           AssertionError: FakeAIHub 脚本已耗尽，但流水线仍在发起调用
+
+tests/fakes.py:56: AssertionError
+___________________ test_inline_generation_reaches_succeeded ___________________
+
+client = <httpx.AsyncClient object at 0x7fe99d26d660>, inline = None
+fake_ai = <tests.fakes.FakeAIHub object at 0x7fe99d26ff70>
+
+    async def test_inline_generation_reaches_succeeded(client, inline, fake_ai):
+        """版本经 steps 端点走到 ``succeeded``，本身就是「流水线写的是注入会话」的证明。
+    
+        本测试环境没有 ``DATABASE_URL``，``db_manager.session()`` 开不了连接，所以若
+        流水线没有复用注入的请求会话（而是去开独立会话），三个阶段一步都写不下去，
+        版本不可能到达 ``succeeded``、``call_count`` 也不可能为 3——这两个断言合起来
+        已经覆盖了「inline 路径复用请求会话而非真实库」这一性质，无需另设只断言
+        「版本数为 1」的测试（那只反映 ``prepare()`` 早已落库，与是否复用会话无关）。
+        """
+        created = await client.post("/api/v1/atoms/projects", json={"title": "T"})
+        public_id = created.json()["public_id"]
+    
+        accepted = await client.post(
+            f"/api/v1/atoms/projects/{public_id}/generate",
+            json={"prompt": "做一个记账工具"},
+        )
+        assert accepted.status_code == 202
+        seq = accepted.json()["version_seq"]
+    
+        steps = await client.get(
+            f"/api/v1/atoms/projects/{public_id}/versions/{seq}/steps"
+        )
+        body = steps.json()
+        assert body["status"] == "succeeded", body
+>       assert fake_ai.call_count() == 3
+E       AttributeError: 'FakeAIHub' object has no attribute 'call_count'
+
+tests/test_generation_inline.py:59: AttributeError
+----------------------------- Captured stdout call -----------------------------
+{"event_name":"funcsea.request.summary","schema_version":1,"function_name":"","app_id":"72e9894085fe469d951174782a2e09a7","environment":"","service_version":"","request_id":null,"trace_id":null,"aws_request_id":null,"http_method":"POST","http_route":"/api/v1/atoms/projects","url_path":"/api/v1/atoms/projects","status_code":201,"duration_ms":23.984,"cold_start":true,"backend_initialized_this_request":false,"initialization_ms":0.0,"init_services_ms":0.0,"init_app_ms":0.0,"init_service_imports_ms":0.0,"db_query_total_ms":0.0,"external_http_total_ms":0.0,"handler_wall_ms":23.984,"db_query_count":0,"external_http_count":0,"timing_overlap":false}
+{"event_name":"funcsea.request.summary","schema_version":1,"function_name":"","app_id":"72e9894085fe469d951174782a2e09a7","environment":"","service_version":"","request_id":null,"trace_id":null,"aws_request_id":null,"http_method":"POST","http_route":"/api/v1/atoms/projects/{public_id}/generate","url_path":"/api/v1/atoms/projects/1e7ff6b9-67a1-4a9e-bbda-58be17630b15/generate","status_code":202,"duration_ms":59.309,"cold_start":false,"backend_initialized_this_request":false,"initialization_ms":0.0,"init_services_ms":0.0,"init_app_ms":0.0,"init_service_imports_ms":0.0,"db_query_total_ms":0.0,"external_http_total_ms":0.0,"handler_wall_ms":59.309,"db_query_count":0,"external_http_count":0,"timing_overlap":false}
+{"event_name":"funcsea.request.summary","schema_version":1,"function_name":"","app_id":"72e9894085fe469d951174782a2e09a7","environment":"","service_version":"","request_id":null,"trace_id":null,"aws_request_id":null,"http_method":"GET","http_route":"/api/v1/atoms/projects/{public_id}/versions/{seq}/steps","url_path":"/api/v1/atoms/projects/1e7ff6b9-67a1-4a9e-bbda-58be17630b15/versions/1/steps","status_code":200,"duration_ms":8.15,"cold_start":false,"backend_initialized_this_request":false,"initialization_ms":0.0,"init_services_ms":0.0,"init_app_ms":0.0,"init_service_imports_ms":0.0,"db_query_total_ms":0.0,"external_http_total_ms":0.0,"handler_wall_ms":8.15,"db_query_count":0,"external_http_count":0,"timing_overlap":false}
+_____________ test_explicitly_disabled_flag_does_not_enable_inline _____________
+
+client = <httpx.AsyncClient object at 0x7fe99d25e7d0>
+fake_ai = <tests.fakes.FakeAIHub object at 0x7fe99d25e800>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe99d693700>
+
+    async def test_explicitly_disabled_flag_does_not_enable_inline(
+        client, fake_ai, monkeypatch
+    ):
+        """``GENERATION_INLINE=0`` 必须是「关闭」，而不是「开启」。
+    
+        ``os.getenv`` 返回字符串，``"0"``/``"false"``/``"no"`` 全为真值——若直接按
+        真值判定，开发者在 ``app/.env`` 里写 ``GENERATION_INLINE=0`` 想关掉这个测试
+        逃生舱，反而会把它打开；而 ``start_app_v2.sh`` 会把 env 文件里的每一行
+        ``KEY=VALUE`` 都 export 进后端进程，所以生产环境同样可被这行配置踩中，
+        ``generate`` 就会在请求内 await 整条 1~4 分钟的流水线，撞上网关 120s 代理
+        读超时（计划 Global Constraints 第 6 条）。
+    
+        断言方式与 ``test_env_unset_keeps_generation_out_of_the_request`` 一致：后台
+        任务必然去开独立 DB 会话（测试环境无 ``DATABASE_URL``，开不了），模型一次都
+        不会被调用；只有 inline 被真正开启时 ``call_count`` 才会是 3。
+        """
+        monkeypatch.setenv("GENERATION_INLINE", "0")
+        created = await client.post("/api/v1/atoms/projects", json={"title": "T"})
+        public_id = created.json()["public_id"]
+    
+        accepted = await client.post(
+            f"/api/v1/atoms/projects/{public_id}/generate",
+            json={"prompt": "做一个计时器"},
+        )
+        assert accepted.status_code == 202
+    
+        await asyncio.sleep(0.05)  # 给后台任务留出跑到失败点的时间
+>       assert fake_ai.call_count() == 0
+E       AttributeError: 'FakeAIHub' object has no attribute 'call_count'
+
+tests/test_generation_inline.py:89: AttributeError
+----------------------------- Captured stdout call -----------------------------
+{"event_name":"funcsea.request.summary","schema_version":1,"function_name":"","app_id":"72e9894085fe469d951174782a2e09a7","environment":"","service_version":"","request_id":null,"trace_id":null,"aws_request_id":null,"http_method":"POST","http_route":"/api/v1/atoms/projects","url_path":"/api/v1/atoms/projects","status_code":201,"duration_ms":5.062,"cold_start":false,"backend_initialized_this_request":false,"initialization_ms":0.0,"init_services_ms":0.0,"init_app_ms":0.0,"init_service_imports_ms":0.0,"db_query_total_ms":0.0,"external_http_total_ms":0.0,"handler_wall_ms":5.062,"db_query_count":0,"external_http_count":0,"timing_overlap":false}
+{"event_name":"funcsea.request.summary","schema_version":1,"function_name":"","app_id":"72e9894085fe469d951174782a2e09a7","environment":"","service_version":"","request_id":null,"trace_id":null,"aws_request_id":null,"http_method":"POST","http_route":"/api/v1/atoms/projects/{public_id}/generate","url_path":"/api/v1/atoms/projects/30a398f8-e81a-4502-8328-b270c2ee6fdd/generate","status_code":202,"duration_ms":63.854,"cold_start":false,"backend_initialized_this_request":false,"initialization_ms":0.0,"init_services_ms":0.0,"init_app_ms":0.0,"init_service_imports_ms":0.0,"db_query_total_ms":0.0,"external_http_total_ms":0.0,"handler_wall_ms":63.854,"db_query_count":0,"external_http_count":0,"timing_overlap":false}
+______________ test_env_unset_keeps_generation_out_of_the_request ______________
+
+client = <httpx.AsyncClient object at 0x7fe99c5837f0>
+fake_ai = <tests.fakes.FakeAIHub object at 0x7fe99d2dbf10>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe99d693e50>
+
+    async def test_env_unset_keeps_generation_out_of_the_request(
+        client, fake_ai, monkeypatch
+    ):
+        """未置位 GENERATION_INLINE 时，请求内绝不 await 流水线（网关 120s 约束）。
+    
+        这是计划 Global Constraints 第 6 条的回归哨兵：``generate`` 恒有请求会话，
+        若把「传入了会话」也当作 inline 依据，生产路径就会在请求内同步等待 1~4 分钟
+        的流水线。后台任务必然去开独立 DB 会话（测试环境无 ``DATABASE_URL``，开不了），
+        所以模型一次都不会被调用——``call_count`` 为 0 即证明生成没有被同步等待。
+        """
+        monkeypatch.delenv("GENERATION_INLINE", raising=False)
+        created = await client.post("/api/v1/atoms/projects", json={"title": "T"})
+        public_id = created.json()["public_id"]
+    
+        accepted = await client.post(
+            f"/api/v1/atoms/projects/{public_id}/generate",
+            json={"prompt": "做一个计时器"},
+        )
+        assert accepted.status_code == 202
+    
+        await asyncio.sleep(0.05)  # 给后台任务留出跑到失败点的时间
+>       assert fake_ai.call_count() == 0
+E       AttributeError: 'FakeAIHub' object has no attribute 'call_count'
+
+tests/test_generation_inline.py:113: AttributeError
+----------------------------- Captured stdout call -----------------------------
+{"event_name":"funcsea.request.summary","schema_version":1,"function_name":"","app_id":"72e9894085fe469d951174782a2e09a7","environment":"","service_version":"","request_id":null,"trace_id":null,"aws_request_id":null,"http_method":"POST","http_route":"/api/v1/atoms/projects","url_path":"/api/v1/atoms/projects","status_code":201,"duration_ms":5.181,"cold_start":false,"backend_initialized_this_request":false,"initialization_ms":0.0,"init_services_ms":0.0,"init_app_ms":0.0,"init_service_imports_ms":0.0,"db_query_total_ms":0.0,"external_http_total_ms":0.0,"handler_wall_ms":5.181,"db_query_count":0,"external_http_count":0,"timing_overlap":false}
+{"event_name":"funcsea.request.summary","schema_version":1,"function_name":"","app_id":"72e9894085fe469d951174782a2e09a7","environment":"","service_version":"","request_id":null,"trace_id":null,"aws_request_id":null,"http_method":"POST","http_route":"/api/v1/atoms/projects/{public_id}/generate","url_path":"/api/v1/atoms/projects/f1b6befd-f8b0-4f4f-92c5-55653233104e/generate","status_code":202,"duration_ms":18.628,"cold_start":false,"backend_initialized_this_request":false,"initialization_ms":0.0,"init_services_ms":0.0,"init_app_ms":0.0,"init_service_imports_ms":0.0,"db_query_total_ms":0.0,"external_http_total_ms":0.0,"handler_wall_ms":18.628,"db_query_count":0,"external_http_count":0,"timing_overlap":false}
+_____________________ test_verify_rejects_client_made_key ______________________
+
+    def test_verify_rejects_client_made_key():
+        """客户端自造 anon-xxx 必须无效——这正是旧 getOwnerKey 的问题。"""
+        assert _verify("anon-abcdefgh-1234567890") is None
+        assert _verify("") is None
+>       assert _verify(None) is None
+
+tests/test_owner_dependency.py:63: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+raw = None
+
+    def _verify(raw: str) -> Optional[str]:
+        """校验匿名标识签名；通过返回 nonce，否则 None。"""
+>       parts = raw.split(".")
+E       AttributeError: 'NoneType' object has no attribute 'split'
+
+dependencies/owner.py:59: AttributeError
+___________________ test_verify_rejects_non_canonical_shape ____________________
+
+    def test_verify_rejects_non_canonical_shape():
+        """形状必须与 ``_issue`` 的输出严格一致，否则 ``anon:`` 键会突破长度上限。
+    
+        这是**有签名密钥**的攻击面：验签只保证「这个 nonce 是你签过的」，
+        不保证 nonce 有多长。攻击者可以发 ``atoms_anon=<超长 nonce>.<有效签名>``，
+        得到 ``anon:{超长 nonce}`` 归属键，超过 ``projects.owner_key`` 的 64 字符列限。
+        旧实现在写入处用 ``[:64]`` 截断把它盖住了；截断被删掉之后，这条路径就真的
+        能打穿写入——所以必须在验签处按形状拒绝。
+        """
+        long_nonce = "a" * 64
+        assert _verify(f"{long_nonce}.{_sign(long_nonce)}") is None
+    
+        nonce = _issue().split(".")[0]
+        sig = _sign(nonce)
+>       assert _verify(f"{'z' * 32}.{_sign('z' * 32)}") is None  # 非 hex
+E       AssertionError: assert 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz' is None
+E        +  where 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz' = _verify('zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.36ee7ad414973d15')
+
+tests/test_owner_dependency.py:85: AssertionError
+_______________ test_distinct_long_subjects_yield_distinct_keys ________________
+
+    async def test_distinct_long_subjects_yield_distinct_keys():
+        """截断式实现会让共享长前缀的两个 sub 塌缩成同一身份（数据泄露，而非外观问题）。"""
+        prefix = "p" * 300
+        keys = {
+            await _owner_key_for_subject(prefix + "a"),
+            await _owner_key_for_subject(prefix + "b"),
+        }
+>       assert len(keys) == 2
+E       AssertionError: assert 1 == 2
+E        +  where 1 = len({'user:ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp'})
+
+tests/test_owner_dependency.py:184: AssertionError
+________________________ test_missing_secret_warns_once ________________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fe99c3c95d0>
+caplog = <_pytest.logging.LogCaptureFixture object at 0x7fe99c3cafe0>
+
+    def test_missing_secret_warns_once(monkeypatch, caplog):
+        """降级本身是对的，但运维必须能从日志发现匿名身份已可伪造；且不能每请求刷屏。"""
+        _drop_jwt_secret(monkeypatch)
+        monkeypatch.setattr(owner_module, "_warned_missing_secret", False, raising=False)
+    
+        with caplog.at_level(logging.WARNING, logger="dependencies.owner"):
+            _sign("nonce-1")
+            _sign("nonce-2")
+            _sign("nonce-3")
+    
+        hits = [r for r in caplog.records if "JWT_SECRET_KEY" in r.getMessage()]
+>       assert len(hits) == 1
+E       assert 0 == 1
+E        +  where 0 = len([])
+
+tests/test_owner_dependency.py:221: AssertionError
+=============================== warnings summary ===============================
+tests/test_generation_inline.py::test_inline_generation_reaches_succeeded
+  /workspace/app/backend/routers/generation_steps.py:45: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    class Generation_stepsResponse(BaseModel):
+
+tests/test_generation_inline.py::test_inline_generation_reaches_succeeded
+  /workspace/app/backend/routers/messages.py:37: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    class MessagesResponse(BaseModel):
+
+tests/test_generation_inline.py::test_inline_generation_reaches_succeeded
+  /workspace/app/backend/routers/projects.py:41: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    class ProjectsResponse(BaseModel):
+
+tests/test_generation_inline.py::test_inline_generation_reaches_succeeded
+  /workspace/app/backend/routers/versions.py:45: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    class VersionsResponse(BaseModel):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_fake_aihub.py::test_exhausted_script_returns_empty_not_error
+FAILED tests/test_generation_inline.py::test_inline_generation_reaches_succeeded
+FAILED tests/test_generation_inline.py::test_explicitly_disabled_flag_does_not_enable_inline
+FAILED tests/test_generation_inline.py::test_env_unset_keeps_generation_out_of_the_request
+FAILED tests/test_owner_dependency.py::test_verify_rejects_client_made_key - ...
+FAILED tests/test_owner_dependency.py::test_verify_rejects_non_canonical_shape
+FAILED tests/test_owner_dependency.py::test_distinct_long_subjects_yield_distinct_keys
+FAILED tests/test_owner_dependency.py::test_missing_secret_warns_once - asser...
+ERROR tests/test_conftest_smoke.py::test_sqlite_can_create_tables
+ERROR tests/test_conftest_smoke.py::test_json_roundtrip_with_timezone_column
+8 failed, 90 passed, 4 warnings, 2 errors in 6.90s
