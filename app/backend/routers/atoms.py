@@ -67,9 +67,14 @@ PROMPT_MAX_LEN = 2000
 # （进程死亡 / 任务消失）。判据是 updated_at，而推进 updated_at 的是流水线
 # 的真实进展点（阶段边界与每次调用落库），不是心跳——心跳已删除。
 # 关系常量（见 services/pipeline.py 顶部与 contracts/generation-lifecycle.md）：
-# STAGE_TIMEOUT(120s) < GENERATION_BUDGET_SECONDS(420s)
-#                      < STALE_AFTER(600s) < 前端轮询上限(720s)
-STALE_AFTER = timedelta(minutes=10)
+# STAGE_TIMEOUT(120s) < CODE_STAGE_TIMEOUT(200s)
+#                      < GENERATION_BUDGET_SECONDS(640s)
+#                      < STALE_AFTER(900s) < 前端轮询上限(1080s)
+#
+# 2026-09-21 由 10 分钟上移到 15 分钟：阶段 3 新增「增量保留校验 + 定向重修」后
+# 总预算由 420s 上调到 640s，若回收阈值仍停在 600s，活任务会在预算用尽之前被
+# 误判为僵尸并改写成 failed——正是本文件反复强调的误杀。阈值必须跟着预算走。
+STALE_AFTER = timedelta(minutes=15)
 
 ERROR_STATUS = {
     "VALIDATION_ERROR": 400,

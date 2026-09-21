@@ -121,6 +121,97 @@ def has_duplicate_structure(doc: str | None) -> bool:
     )
 
 
+# ---------------------------------------------------------------- 增量保留校验
+#
+# 为什么需要它（2026-09-21 实测结论）：
+# 增量迭代时模型会「顺手精简」上一版——实测「每日歌曲推荐 + 不感兴趣按钮」两轮，
+# v2 丢掉了 v1 的 ♡ 收藏 / ← 回到今日推荐，还把 🎲 换一首 改名成 🔄 换一批。
+# 在阶段三提示词里加硬性保留约束只能减轻、不能根治（加约束后改名消失，但仍有
+# 控件丢失）。因此保障必须落在**产物**上：用确定性代码从 v1 提取可见控件文案，
+# 在 v2 产出后校验保留率，缺失则带清单定向重试。校验器本身不依赖模型自觉。
+#
+# 只提取「可见控件文案」而不做 AST 比对，是刻意的取舍：控件文案是用户能直接
+# 感知到的功能入口（按钮/导航/标题），字符串提取确定性高、无改写风险；而让模型
+# 输出结构化补丁需要另起一套受限生成协议，失败率更高。
+
+# 承载功能入口的标签：按钮、链接、表单控件、区块标题。
+_CONTROL_TAG_PATTERN = re.compile(
+    r"<(button|a|h1|h2|h3|summary|legend|label)\b[^>]*>(?P<inner>.*?)</\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+# value 承载文案的 input（按钮型）。
+_INPUT_VALUE_PATTERN = re.compile(
+    r"<input\b[^>]*\btype\s*=\s*[\"']?(?:button|submit|reset)[\"']?[^>]*"
+    r"\bvalue\s*=\s*[\"'](?P<value>[^\"']+)[\"']",
+    re.IGNORECASE,
+)
+_TAG_STRIP_PATTERN = re.compile(r"<[^>]*>")
+# 模板占位符（``${...}`` / ``{{...}}``）内是运行期数据，不是固定文案。
+_TEMPLATE_SLOT_PATTERN = re.compile(r"\$\{[^}]*\}|\{\{[^}]*\}\}")
+_WHITESPACE_PATTERN = re.compile(r"\s+")
+
+# 文案长度闸门：过短（单个标点）无区分度，过长的多半是整段说明而非控件。
+_LABEL_MIN_CHARS = 2
+_LABEL_MAX_CHARS = 40
+
+
+def _normalize_label(raw: str) -> str:
+    """把标签内部文本归一化为可比对的控件文案。"""
+    text = _TEMPLATE_SLOT_PATTERN.sub(" ", raw)
+    text = _TAG_STRIP_PATTERN.sub(" ", text)
+    text = text.replace("&nbsp;", " ")
+    return _WHITESPACE_PATTERN.sub(" ", text).strip()
+
+
+def extract_control_labels(html: str | None) -> set[str]:
+    """提取页面中可见的控件文案集合（按钮 / 链接 / 区块标题等）。
+
+    作用于**原始 HTML 文本**，因此由 JS 模板字符串渲染的卡片内按钮同样能被
+    提取到（它们在源码里依然是 ``<button>...</button>`` 字面量）。模板占位符
+    会被剔除，避免把运行期数据当成固定文案。
+
+    Returns:
+        归一化后的文案集合；无可提取内容时返回空集合。
+    """
+    if not html:
+        return set()
+
+    labels: set[str] = set()
+    for match in _CONTROL_TAG_PATTERN.finditer(html):
+        label = _normalize_label(match.group("inner"))
+        if _LABEL_MIN_CHARS <= len(label) <= _LABEL_MAX_CHARS:
+            labels.add(label)
+    for match in _INPUT_VALUE_PATTERN.finditer(html):
+        label = _normalize_label(match.group("value"))
+        if _LABEL_MIN_CHARS <= len(label) <= _LABEL_MAX_CHARS:
+            labels.add(label)
+    return labels
+
+
+def find_missing_controls(
+    previous_html: str | None, new_html: str | None
+) -> list[str]:
+    """找出上一版有、新版却不见了的控件文案。
+
+    判定方式是「文案是否还出现在新版全文中」而非集合差集：模型可能把按钮换了
+    标签（``<button>`` 改成 ``<a>``）或调整了嵌套层级，那不算功能丢失，不应误报。
+    只有文案**整体消失**才算真正丢了功能入口——这同时覆盖了「改名」
+    （旧名消失即判定缺失）。
+
+    Returns:
+        缺失文案列表，按其在上一版中的出现顺序排列；无缺失时为空列表。
+    """
+    previous_labels = extract_control_labels(previous_html)
+    if not previous_labels or not new_html:
+        return []
+
+    missing = [label for label in previous_labels if label not in new_html]
+    # 结果需稳定可复现（要写进提示词与失败记录），按上一版出现位置排序。
+    source = previous_html or ""
+    missing.sort(key=lambda label: source.find(label))
+    return missing
+
+
 def inject_csp(html: str | None) -> str:
     """向 HTML 文档注入 CSP meta 标签。
 

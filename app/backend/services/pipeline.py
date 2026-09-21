@@ -42,6 +42,7 @@ from services.aihub import AIHubService
 from services.aihub_errors import UpstreamError
 from services.html_extract import (
     extract_html,
+    find_missing_controls,
     has_duplicate_structure,
     inject_csp,
     is_complete_document,
@@ -96,10 +97,27 @@ STAGE_TIMEOUT = 120.0
 #                                                      < GENERATION_BUDGET_SECONDS(420s)
 # 即放宽后最坏情形仍被总预算兜住，420 < 600(STALE_AFTER) 的下游不变量不受影响。
 CODE_STAGE_TIMEOUT = 200.0
+# 增量保留校验失败后，定向重修（补回缺失控件）最多发起的额外调用次数。
+# 取 1：实测缺失项是「模型顺手精简」而非能力不足，给出确切清单后一次即可补回；
+# 给更多次只会线性吃掉预算，收益递减。
+PRESERVE_REPAIR_MAX_ATTEMPTS = 1
+# 日志里最多列举几项缺失文案，避免长清单淹没日志。
+_MISSING_LOG_LIMIT = 8
 # 整条流水线（阶段 1+2+3 及其全部重试、续写、重跑）从起点到终态的总预算。
 # 修复前的漏洞：6 次 _call_step × 每次最坏 3×240s+退避 = 4329s ≈ 72 分钟，
 # 而前端只等 12 分钟。预算必须**整体**生效而非逐次生效。
-GENERATION_BUDGET_SECONDS = 420.0
+#
+# 2026-09-21 上调 420 → 640：阶段 3 新增「增量保留校验 + 定向重修」后，最坏
+# 路径从「首轮 + 一次续写/重跑」变成再多一次重修调用，即
+#   (2 + PRESERVE_REPAIR_MAX_ATTEMPTS) × CODE_STAGE_TIMEOUT = 3 × 200 = 600s
+# 若预算仍留在 420s，重修几乎必然在发起前就被预算闸门拦掉（budget_exhausted），
+# 新机制等于没接上。640 = 600 + 40s 余量（阶段 1+2 实测各 7～8s）。
+#
+# 上调预算会顶到下游不变量 420 < STALE_AFTER(600) < 前端上限(720)，因此这两个
+# 阈值必须同步上移，否则活任务会在预算内被 stale 回收误杀：
+#   STALE_AFTER 600 → 900，前端轮询上限 720 → 1080。
+# 不等式恢复为 640 < 900 < 1080，三者关系不变，只是整体放大。
+GENERATION_BUDGET_SECONDS = 640.0
 
 # S3.1 退避重试：rate_limit / timeout / upstream_5xx / unknown 最多 2 次尝试，
 # 间隔 0.5 → 1 秒。auth 不重试。次数由 3 收紧到 2，因为 3 次重试的乘积
@@ -299,6 +317,10 @@ class GenerationPipeline:
         # 「本地代码故障」时这个值是 0，正好把「一次上游调用都没发生」这件事
         # 记录下来，与「上游重试耗尽」区分开。
         self._current_attempts: int = 0
+        # 增量保留校验的最终缺失控件文案（阶段 3 产物级校验，见
+        # _enforce_control_preservation）。重修后仍缺失时非空，写进 summary
+        # 供排障与前端提示；首轮生成或无缺失时为空列表。
+        self._missing_controls: list[str] = []
 
     def _remaining(self) -> float:
         """距总预算耗尽还剩多少秒（未启动预算时为无穷大）。"""
@@ -531,6 +553,10 @@ class GenerationPipeline:
             "structure": design_summary,
             "app_name": app_name,
         }
+        if self._missing_controls:
+            # 保留校验重修后仍缺失：如实落库。缺失不阻断发布（新需求已实现，
+            # 且 v1 不可变可回滚），但必须可追溯，否则又退回「静默丢功能」。
+            summary["missing_controls"] = self._missing_controls
         title = app_name or _fallback_title(prompt)
 
         version = await self._get_version(project_public_id, version_seq)
@@ -636,6 +662,102 @@ class GenerationPipeline:
         user = prompts.build_code_user(
             prompt, analysis_raw, design_raw, previous_html, history_prompts
         )
+        doc = await self._generate_code_document(
+            project_public_id,
+            version_seq,
+            user,
+        )
+        return await self._enforce_control_preservation(
+            project_public_id,
+            version_seq,
+            previous_html,
+            doc,
+        )
+
+    async def _enforce_control_preservation(
+        self,
+        project_public_id: str,
+        version_seq: int,
+        previous_html: str | None,
+        doc: str,
+    ) -> str:
+        """产物级增量保留校验：缺了上一版的功能入口就带清单定向重修。
+
+        提示词约束只能减轻、不能根治模型在整篇重写时的顺手精简（实测：加了
+        硬性保留约束后「改名」消失，但仍丢失 ♡ 收藏 / ← 回到今日推荐）。
+        因此这里改为在**产物**上做确定性校验——不依赖模型自觉。
+
+        重修失败不阻断发布：能补回最好，补不回也保留这一版并记录缺失项。
+        理由是此时新需求已经实现，直接判失败会让用户连新功能一起拿不到，
+        反而比「有新功能但少了两个旧按钮」更糟；v1 本身不可变，用户随时可回滚。
+        """
+        if not previous_html:
+            return doc  # 首轮生成没有基线，无从校验
+
+        for attempt in range(PRESERVE_REPAIR_MAX_ATTEMPTS):
+            missing = find_missing_controls(previous_html, doc)
+            if not missing:
+                return doc
+            logger.warning(
+                "project=%s seq=%s 增量保留校验失败，缺失 %s 项：%s，发起第 %s 次定向重修",
+                project_public_id[:8],
+                version_seq,
+                len(missing),
+                "/".join(missing[:_MISSING_LOG_LIMIT]),
+                attempt + 1,
+            )
+            if self._remaining() < MIN_CALL_BUDGET_SECONDS:
+                logger.error(
+                    "project=%s seq=%s 预算不足，跳过保留重修（缺失 %s 项）",
+                    project_public_id[:8],
+                    version_seq,
+                    len(missing),
+                )
+                break
+            try:
+                repaired = await self._generate_code_document(
+                    project_public_id,
+                    version_seq,
+                    prompts.build_preserve_retry_user(doc, missing),
+                )
+            except PipelineError as exc:
+                # 重修本身失败（截断/预算/上游）不应否定已经可用的产出。
+                logger.error(
+                    "project=%s seq=%s 保留重修失败（%s），保留原产出",
+                    project_public_id[:8],
+                    version_seq,
+                    exc.error_type,
+                )
+                break
+            # 只有当重修确实补回了更多控件才采纳，避免越修越少。
+            if len(find_missing_controls(previous_html, repaired)) < len(missing):
+                doc = repaired
+            else:
+                logger.warning(
+                    "project=%s seq=%s 重修未减少缺失项，保留原产出",
+                    project_public_id[:8],
+                    version_seq,
+                )
+                break
+
+        self._missing_controls = find_missing_controls(previous_html, doc)
+        if self._missing_controls:
+            logger.error(
+                "project=%s seq=%s 增量保留校验最终仍缺失 %s 项：%s",
+                project_public_id[:8],
+                version_seq,
+                len(self._missing_controls),
+                "/".join(self._missing_controls[:_MISSING_LOG_LIMIT]),
+            )
+        return doc
+
+    async def _generate_code_document(
+        self,
+        project_public_id: str,
+        version_seq: int,
+        user: str,
+    ) -> str:
+        """发起一轮代码生成并跑完「截断续写 + 整篇重跑」恢复链，返回完整文档。"""
         for attempt in range(2):
             code_raw = await self._call_step(
                 project_public_id,

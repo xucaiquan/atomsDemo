@@ -2,8 +2,8 @@
 
 本文件守护本特性最核心的一条不等式链：
 
-    STAGE_TIMEOUT(120s) < GENERATION_BUDGET_SECONDS(420s)
-                        < STALE_AFTER(600s) < 前端轮询上限(720s)
+    STAGE_TIMEOUT(120s) < GENERATION_BUDGET_SECONDS(640s)
+                        < STALE_AFTER(900s) < 前端轮询上限(1080s)
 
 它必须由**测试**守护而不是由注释守护，因为这条链一旦被破坏，症状是线上
 「UI 永远转圈」这种无异常、无日志的静默故障，代码评审很难看出来。
@@ -95,8 +95,15 @@ def test_code_stage_timeout_exceeds_measured_upstream_latency():
 
 
 def test_code_stage_worst_case_fits_inside_budget():
-    """放宽后的阶段 3 最坏耗时仍须被总预算兜住（首轮 + 一次续写/重跑）。"""
-    worst = 2 * pipeline_module.CODE_STAGE_TIMEOUT
+    """放宽后的阶段 3 最坏耗时仍须被总预算兜住。
+
+    2026-09-21 起阶段 3 的最坏路径多了一次「增量保留校验失败后的定向重修」
+    调用，即 首轮 + 一次续写/重跑 + 一次重修。预算必须覆盖这条完整路径，
+    否则重修会在发起前就被预算闸门拦成 budget_exhausted，新机制形同虚设。
+    """
+    worst = (
+        2 + pipeline_module.PRESERVE_REPAIR_MAX_ATTEMPTS
+    ) * pipeline_module.CODE_STAGE_TIMEOUT
     assert worst <= pipeline_module.GENERATION_BUDGET_SECONDS, (
         f"阶段 3 最坏 {worst}s 超出总预算 "
         f"{pipeline_module.GENERATION_BUDGET_SECONDS}s"
@@ -104,7 +111,7 @@ def test_code_stage_worst_case_fits_inside_budget():
 
 
 def test_budget_shorter_than_stale_recovery():
-    """420 < 600：活任务的最长静默期必须短于回收阈值。
+    """640 < 900：活任务的最长静默期必须短于回收阈值。
 
     活任务在 versions.updated_at 上的静默期不超过总预算（详见 pipeline.py
     末尾注释：_call_step 只改 generation_steps，不推进 versions.updated_at）。
@@ -113,7 +120,6 @@ def test_budget_shorter_than_stale_recovery():
     """
     budget = pipeline_module.GENERATION_BUDGET_SECONDS
     stale_after = atoms_module.STALE_AFTER.total_seconds()
-    assert atoms_module.STALE_AFTER == timedelta(minutes=10)
     assert budget < stale_after, (
         f"预算 {budget}s 不得大于等于回收阈值 {stale_after}s，否则活任务会被误杀"
     )

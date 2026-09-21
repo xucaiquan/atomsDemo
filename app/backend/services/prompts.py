@@ -240,6 +240,28 @@ INCREMENT_PRESERVE_RULES = (
 )
 
 
+def build_preserve_retry_user(current_html: str, missing: list[str]) -> str:
+    """构造「控件缺失定向重修」的用户消息（产物级保留校验的重试输入）。
+
+    与泛泛地说「不要删东西」不同，这里把**确切的缺失清单**交回模型，并要求
+    它在自己刚产出的这版基础上补回，其余部分保持不动——把一个开放的生成任务
+    收窄成一个封闭的修补任务。
+    """
+    items = "\n".join(f"- {label}" for label in missing)
+    return (
+        "你刚才产出的这一版**删掉了上一版已有的功能入口**，这是不允许的。\n\n"
+        "以下文案在上一版中存在，但在你的新版本中已经找不到了：\n"
+        f"{items}\n\n"
+        "请在你刚产出的这版页面基础上，把上面列出的每一项**逐字**补回原位，"
+        "并确保它们对应的交互逻辑同样可用。除此之外**不要做任何其他改动**：\n"
+        "不要重新排版，不要改写其他文案，不要删减示例数据，"
+        "本次新增的功能要原样保留。\n\n"
+        "这是你刚产出的版本：\n\n"
+        + truncate_previous_html(current_html)
+        + "\n\n现在请输出补回缺失项后的**完整** HTML 源码。"
+    )
+
+
 def build_code_user(
     prompt: str,
     analysis: str,

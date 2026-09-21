@@ -48,10 +48,14 @@ import {
 const POLL_INTERVAL_MS = 2500;
 
 /**
- * 前端等待后台生成终态的最长时间。略大于后端陈旧任务恢复阈值（10 分钟），
+ * 前端等待后台生成终态的最长时间。略大于后端陈旧任务恢复阈值（15 分钟），
  * 超时后后端会把卡住的版本标记为 failed，前端同步展示可读原因。
+ *
+ * 2026-09-21 由 12 分钟上调到 18 分钟：后端阶段 3 增加了「增量保留校验 + 定向
+ * 重修」，总预算相应由 420s 上调到 640s，回收阈值由 600s 上调到 900s。前端必须
+ * 晚于回收阈值放弃，否则用户永远等不到后端写入的真实终态。
  */
-const GENERATION_POLL_TIMEOUT_MS = 12 * 60 * 1000;
+const GENERATION_POLL_TIMEOUT_MS = 18 * 60 * 1000;
 
 /** 预览失败原因条里展示的上游错误分类（S3.5 error_type）。 */
 const ERROR_TYPE_LABELS: Record<string, string> = {
