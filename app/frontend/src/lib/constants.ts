@@ -15,6 +15,16 @@ export function formatRelative(iso: string | null): string {
   return new Date(iso).toLocaleDateString('zh-CN');
 }
 
-// 设计文档 2026-09-20 S2.1：删除可伪造的 getOwnerKey()。
-// 归属键改由服务端派生（dependencies/owner.py），前端只经 X-Atoms-Anon
-// 头回传后端签发的匿名标识（见 lib/atoms.ts）。
+/** 从 localStorage 读取（或生成）浏览器会话标识，对应 spec「无账号体系」假设。 */
+export function getOwnerKey(): string {
+  try {
+    let key = localStorage.getItem('atoms_demo_owner');
+    if (!key) {
+      key = `anon-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+      localStorage.setItem('atoms_demo_owner', key);
+    }
+    return key;
+  } catch {
+    return 'anon';
+  }
+}

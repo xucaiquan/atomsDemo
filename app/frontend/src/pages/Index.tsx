@@ -1,13 +1,11 @@
 /**
  * Workspace —— 主工作区（三栏布局）。
  *
- * 核心流程（对应 specs/001-atoms-demo 与设计文档 2026-09-20 S2/S5）：
- * 1. 提交瞬间本地构造 3 条步骤骨架并渲染，不等任何网络往返（SC-002）
+ * 核心流程（对应 specs/001-atoms-demo）：
+ * 1. 提交瞬间本地构造 3 条步骤骨架并渲染，不等任何网络往返（SC-002「3 秒内首个可见反馈」）
  * 2. 生成期间轮询步骤状态，把真实进程映射到步骤流转（US4 / FR-008）
  * 3. 成功后渲染进沙箱 iframe；失败时保留用户输入并给出可读中文提示（FR-011）
- * 4. 认证三态（loading/authenticated/anonymous）：登录/登出切换身份时清空
- *    全部工作区状态，杜绝跨身份数据残留（S2.4）
- * 5. 预览与源码展示同一版本的大小与 SHA-256；回滚走 restore 生成新版本（S5）
+ * 4. 项目列表、版本切换、对话记录、源码查看全部持久化可找回（US2 / US3）
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
@@ -16,8 +14,6 @@ import {
   Code2,
   History,
   Loader2,
-  LogIn,
-  LogOut,
   MessageSquare,
   MonitorPlay,
   Plus,
@@ -33,7 +29,6 @@ import ProjectList from '@/components/ProjectList';
 import PromptInput from '@/components/PromptInput';
 import VersionSwitcher from '@/components/VersionSwitcher';
 import { Button } from '@/components/ui/button';
-import { useAuth } from '@/contexts/AuthContext';
 import {
   atomsApi,
   buildLocalSteps,
@@ -53,19 +48,7 @@ const POLL_INTERVAL_MS = 2500;
  */
 const GENERATION_POLL_TIMEOUT_MS = 12 * 60 * 1000;
 
-/** 预览失败原因条里展示的上游错误分类（S3.5 error_type）。 */
-const ERROR_TYPE_LABELS: Record<string, string> = {
-  auth: '上游鉴权失败',
-  rate_limit: '上游限流（已自动重试）',
-  timeout: '上游响应超时',
-  empty: '上游返回空内容',
-  truncated: '输出被截断',
-  unknown: '未知错误',
-};
-
 export default function Index() {
-  const { user, status: authStatus, login, logout } = useAuth();
-
   // ---------------- 项目与详情 ----------------
   const [projects, setProjects] = useState<ProjectBrief[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
@@ -78,10 +61,7 @@ export default function Index() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [steps, setSteps] = useState<GenerationStep[]>([]);
   const [failedMessage, setFailedMessage] = useState<string | null>(null);
-  const [failedType, setFailedType] = useState<string | null>(null);
   const [html, setHtml] = useState('');
-  // 当前展示版本的 SHA-256（S5.2：预览与源码工具条渲染同一个值）
-  const [htmlSha256, setHtmlSha256] = useState('');
   const [activeSeq, setActiveSeq] = useState<number | null>(null);
   const [view, setView] = useState<'preview' | 'code'>('preview');
 
@@ -99,33 +79,10 @@ export default function Index() {
     }
   }, []);
 
-  /** 清空工作区所有与身份绑定的状态（S2.4：登录/登出/新项目共用）。 */
-  const resetWorkspace = useCallback(() => {
-    stopPollingRef.current?.();
-    setIsGenerating(false);
-    generatingSeqRef.current = null;
-    resumedRef.current = null;
-    setActiveId(null);
-    setDetail(null);
-    setProjects([]);
-    setHtml('');
-    setHtmlSha256('');
-    setSteps([]);
-    setActiveSeq(null);
-    setFailedMessage(null);
-    setFailedType(null);
-    setPrompt('');
-    setView('preview');
-  }, []);
-
   const openProject = useCallback(async (publicId: string) => {
     setActiveId(publicId);
     setDetailLoading(true);
     setFailedMessage(null);
-    setFailedType(null);
-    // 切换项目先清空旧 HTML，避免旧内容挂在新项目名下（S5.3 过渡态）
-    setHtml('');
-    setHtmlSha256('');
     try {
       const data = await atomsApi.getProject(publicId);
       setDetail(data);
@@ -136,16 +93,13 @@ export default function Index() {
         try {
           const full = await atomsApi.getVersion(publicId, latest.seq);
           setHtml(full.html || '');
-          setHtmlSha256(full.html_sha256 || '');
         } catch {
           setHtml('');
-          setHtmlSha256('');
         }
         setSteps(latest.steps);
       } else {
         setActiveSeq(null);
         setHtml('');
-        setHtmlSha256('');
         setSteps([]);
       }
     } catch (e) {
@@ -159,48 +113,17 @@ export default function Index() {
     void refreshProjects();
   }, [refreshProjects]);
 
-  // ---------------- 身份切换清态（S2.4） ----------------
-  // auth 解析完成（loading → authenticated/anonymous）后，若身份与上次不同，
-  // 清空全部工作区状态并按新身份重新拉列表。me() 未返回前不做任何假定。
-  const identityRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (authStatus === 'loading') return;
-    const key = authStatus === 'authenticated' && user ? `u:${user.id}` : 'anon';
-    if (identityRef.current === null) {
-      identityRef.current = key;
-      return;
-    }
-    if (identityRef.current !== key) {
-      identityRef.current = key;
-      resetWorkspace();
-      void refreshProjects();
-    }
-  }, [authStatus, user, resetWorkspace, refreshProjects]);
-
-  const handleLogout = useCallback(async () => {
-    await logout();
-    // logout() 会把状态切到 anonymous，上面的身份 effect 负责清态与重拉
-  }, [logout]);
-
-  // ---------------- 版本切换（US3 / FR-007 / S5.3） ----------------
+  // ---------------- 版本切换（US3 / FR-007） ----------------
   const switchVersion = useCallback(
     async (seq: number) => {
       if (!activeId) return;
       setActiveSeq(seq);
       setView('preview');
-      // 先清空旧 HTML：加载中不会把旧版本内容标成新版本（过渡态修复）
-      setHtml('');
-      setHtmlSha256('');
-      setFailedMessage(null);
-      setFailedType(null);
       try {
         const full = await atomsApi.getVersion(activeId, seq);
         setHtml(full.html || '');
-        setHtmlSha256(full.html_sha256 || '');
-        if (full.status === 'failed') {
-          setFailedMessage(full.error);
-          setFailedType(full.error_type || null);
-        }
+        if (full.status === 'failed') setFailedMessage(full.error);
+        else setFailedMessage(null);
         const version = detail?.versions.find((v) => v.seq === seq);
         if (version) setSteps(version.steps);
       } catch (e) {
@@ -208,30 +131,6 @@ export default function Index() {
       }
     },
     [activeId, detail],
-  );
-
-  // ---------------- 回滚（S5.1：回滚即新版本） ----------------
-  const handleRestore = useCallback(
-    async (seq: number) => {
-      if (!activeId) return;
-      try {
-        const res = await atomsApi.restoreVersion(activeId, seq);
-        toast.success(`已回滚 v${seq}，生成新版本 v${res.version_seq}`);
-        const data = await atomsApi.getProject(activeId);
-        setDetail(data);
-        const restored = data.versions.find((v) => v.seq === res.version_seq);
-        if (restored) setSteps(restored.steps);
-        setActiveSeq(res.version_seq);
-        setHtml('');
-        setHtmlSha256('');
-        const full = await atomsApi.getVersion(activeId, res.version_seq);
-        setHtml(full.html || '');
-        setHtmlSha256(full.html_sha256 || '');
-      } catch (e) {
-        toast.error((e as Error).message || '回滚失败');
-      }
-    },
-    [activeId],
   );
 
   // ---------------- 后台生成轮询（异步受理 + 终态驱动） ----------------
@@ -247,10 +146,6 @@ export default function Index() {
       pollTimerRef.current = null;
     }
   }, []);
-
-  // 供 resetWorkspace（早于定义处使用）安全调用
-  const stopPollingRef = useRef<(() => void) | null>(null);
-  stopPollingRef.current = stopPolling;
 
   /** 轮询直到版本进入终态；网络抖动不中断，超时按失败处理。 */
   const awaitGeneration = useCallback(
@@ -298,10 +193,8 @@ export default function Index() {
       try {
         const full = await atomsApi.getVersion(publicId, snapshot.version_seq);
         setHtml(full.html || '');
-        setHtmlSha256(full.html_sha256 || '');
         setActiveSeq(full.seq);
         setFailedMessage(null);
-        setFailedType(null);
         toast.success('生成完成，在右侧直接体验');
       } catch {
         setFailedMessage('生成结果加载失败，可切换版本重试');
@@ -309,12 +202,10 @@ export default function Index() {
     } else if (snapshot.status === 'cancelled') {
       // 用户主动停止：不算失败，展示取消态步骤，旧版本保持可用
       setFailedMessage(null);
-      setFailedType(null);
       if (snapshot.steps.length) setSteps(snapshot.steps);
       toast.info('已停止本次生成，之前的版本不受影响');
     } else {
       setFailedMessage(snapshot.error || '生成失败，你的描述已保留');
-      setFailedType(snapshot.error_type || null);
       toast.error(snapshot.error || '生成失败，你的描述已保留');
       if (snapshot.steps.length) setSteps(snapshot.steps);
     }
@@ -335,7 +226,6 @@ export default function Index() {
     const text = prompt.trim();
     if (!text || isGenerating) return;
     setFailedMessage(null);
-    setFailedType(null);
     setIsGenerating(true);
     setView('preview');
 
@@ -352,6 +242,8 @@ export default function Index() {
       }
 
       // ③ 受理生成：后端只做校验 + 落库，毫秒级返回 202 + version_seq。
+      //    旧实现同步等待三阶段（3 次模型调用，1~4 分钟），超过网关 120s
+      //    代理读超时被掐断 —— 这正是贪吃蛇生成失败的根因。
       const accepted = await atomsApi.generate(publicId, text);
       generatingSeqRef.current = accepted.version_seq;
       setPrompt('');
@@ -366,9 +258,8 @@ export default function Index() {
       stopPolling();
       setIsGenerating(false);
       const error = e as Error & { code?: string };
-      // 受理前的校验错误（400/403/404/409）：输入保留（FR-011），骨架回退失败态
+      // 受理前的校验错误（400/404/409）：输入保留（FR-011），骨架回退失败态
       setFailedMessage(error.message || '生成失败，请稍后重试');
-      setFailedType(null);
       toast.error(error.message || '生成失败，你的描述已保留');
       setSteps((prev) =>
         prev.map((s, i) =>
@@ -409,6 +300,8 @@ export default function Index() {
   useEffect(() => stopPolling, [stopPolling]);
 
   // ---------------- 停止生成（任务中断能力） ----------------
+  // 调用后端取消接口：版本与活跃步骤立即落库为 cancelled，进程内后台任务被
+  // task.cancel() 即时中断；进行中的轮询检测到 cancelled 终态后自然收尾。
   const handleStop = useCallback(async () => {
     const seq = generatingSeqRef.current;
     if (!activeId || seq == null) return;
@@ -425,11 +318,9 @@ export default function Index() {
     setActiveId(null);
     setDetail(null);
     setHtml('');
-    setHtmlSha256('');
     setSteps([]);
     setActiveSeq(null);
     setFailedMessage(null);
-    setFailedType(null);
     setPrompt('');
     setView('preview');
   }, []);
@@ -452,16 +343,6 @@ export default function Index() {
   const versions: VersionBrief[] = detail?.versions ?? [];
   const messages: ConversationMessage[] = detail?.messages ?? [];
   const hasExistingApp = !!html && !isGenerating;
-  const isDemoProject = !!detail?.is_demo;
-
-  // 当前展示版本的大小（KB），与 SHA-256 一起构成一致性标识（S5.2）
-  const htmlSizeKb = html ? (html.length / 1024).toFixed(1) : null;
-  const versionMeta =
-    activeSeq != null && html ? (
-      <span className="shrink-0 rounded-md border border-slate-800 bg-slate-900/60 px-2 py-0.5 font-mono text-[10px] text-slate-400">
-        v{activeSeq} · {htmlSizeKb}KB · SHA {htmlSha256 ? `${htmlSha256.slice(0, 8)}…` : '—'}
-      </span>
-    ) : null;
 
   return (
     <div className="flex h-screen flex-col bg-slate-950 text-slate-100">
@@ -480,38 +361,6 @@ export default function Index() {
               <Loader2 className="h-3 w-3 animate-spin" />
               智能体工作中
             </span>
-          )}
-          {/* 认证入口（S2）：匿名可用，登录是显式按钮，绝不自动跳转 */}
-          {authStatus === 'loading' ? (
-            <span className="flex items-center gap-1.5 px-2 text-[11px] text-slate-500">
-              <Loader2 className="h-3 w-3 animate-spin" />
-              登录态检查中
-            </span>
-          ) : authStatus === 'authenticated' && user ? (
-            <>
-              <span className="hidden max-w-40 truncate text-[11px] text-slate-400 sm:block">
-                {user.name || user.email || user.id}
-              </span>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => void handleLogout()}
-                className="gap-1.5 rounded-xl border-slate-700 bg-transparent text-slate-300 hover:bg-slate-800 hover:text-white"
-              >
-                <LogOut className="h-3.5 w-3.5" />
-                退出
-              </Button>
-            </>
-          ) : (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={login}
-              className="gap-1.5 rounded-xl border-slate-700 bg-transparent text-slate-300 hover:bg-sky-500/10 hover:text-sky-300"
-            >
-              <LogIn className="h-3.5 w-3.5" />
-              登录（可选）
-            </Button>
           )}
           <Button
             size="sm"
@@ -600,7 +449,6 @@ export default function Index() {
               onStop={() => void handleStop()}
               isGenerating={isGenerating}
               hasProject={!!activeId && hasExistingApp}
-              disabled={isDemoProject}
             />
           </div>
         </section>
@@ -639,27 +487,12 @@ export default function Index() {
                 versions={versions}
                 activeSeq={activeSeq}
                 onSelect={(seq) => void switchVersion(seq)}
-                onRestore={(seq) => void handleRestore(seq)}
               />
             </div>
-            {versionMeta}
             {detail && (
               <span className="shrink-0 truncate text-xs text-slate-500">{detail.title}</span>
             )}
           </div>
-
-          {/* 预览失败原因条（S5.4）：展示失败版本的可读原因与上游错误分类 */}
-          {failedMessage && !isGenerating && (
-            <div className="flex shrink-0 items-center gap-2 border-b border-rose-500/20 bg-rose-500/10 px-4 py-1.5 text-[11px] text-rose-300">
-              <span className="font-medium">预览不可用：</span>
-              <span className="min-w-0 flex-1 truncate">{failedMessage}</span>
-              {failedType && (
-                <span className="shrink-0 rounded border border-rose-500/30 px-1.5 py-0.5 font-mono text-[10px]">
-                  {ERROR_TYPE_LABELS[failedType] || failedType}
-                </span>
-              )}
-            </div>
-          )}
 
           <div className="min-h-0 flex-1">
             {detailLoading ? (
@@ -678,7 +511,7 @@ export default function Index() {
                 }
               />
             ) : (
-              <CodeViewer html={html} seq={activeSeq} sha256={htmlSha256} />
+              <CodeViewer html={html} />
             )}
           </div>
         </main>

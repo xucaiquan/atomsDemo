@@ -45,20 +45,11 @@ def test_history_block_caps_item_count():
     assert "需求5" not in block
 
 
-def test_history_block_truncates_older_item():
-    """非最新条目按 HISTORY_ITEM_CHARS 截断（S3.3）。"""
+def test_history_block_truncates_long_item():
     long_prompt = "字" * (prompts.HISTORY_ITEM_CHARS + 500)
-    block = prompts.build_history_block([long_prompt, "收尾需求"])
+    block = prompts.build_history_block([long_prompt])
     assert "字" * prompts.HISTORY_ITEM_CHARS in block
     assert "字" * (prompts.HISTORY_ITEM_CHARS + 1) not in block
-
-
-def test_history_block_latest_item_gets_larger_budget():
-    """最新一条放宽到 HISTORY_LATEST_ITEM_CHARS：长需求里的关键约束不被裁掉。"""
-    long_prompt = "字" * (prompts.HISTORY_LATEST_ITEM_CHARS + 500)
-    block = prompts.build_history_block(["旧需求", long_prompt])
-    assert "字" * prompts.HISTORY_LATEST_ITEM_CHARS in block
-    assert "字" * (prompts.HISTORY_LATEST_ITEM_CHARS + 1) not in block
 
 
 # ---------- 指代消解：分析 / 代码阶段用户消息 ----------

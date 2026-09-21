@@ -1,8 +1,64 @@
-/**
- * 旧 Axios 认证封装已按设计文档 2026-09-20 S2.1 移除。
- *
- * 认证统一改走平台 Web SDK（`client.auth.me / toLogin / logout`），
- * 见 src/contexts/AuthContext.tsx。此文件保留为空模块仅为兼容历史引用，
- * 新代码不得再从这里导入任何内容。
- */
-export {};
+import axios, { AxiosInstance } from 'axios';
+import { getAPIBaseURL } from './config';
+
+class RPApi {
+  private client: AxiosInstance;
+
+  constructor() {
+    this.client = axios.create({
+      withCredentials: true,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+  }
+
+  private getBaseURL() {
+    return getAPIBaseURL();
+  }
+
+  async getCurrentUser() {
+    try {
+      const response = await this.client.get(
+        `${this.getBaseURL()}/api/v1/auth/me`
+      );
+      return response.data;
+    } catch (error) {
+      if (error.response?.status === 401) {
+        return null;
+      }
+      throw new Error(
+        error.response?.data?.detail || 'Failed to get user info'
+      );
+    }
+  }
+
+  async login() {
+    try {
+      const response = await this.client.get(
+        `${this.getBaseURL()}/api/v1/auth/login`
+      );
+      // The backend will redirect to OIDC provider
+      // SSO will work via cookies automatically
+      window.location.href = response.data.redirect_url;
+    } catch (error) {
+      throw new Error(
+        error.response?.data?.detail || 'Failed to initiate login'
+      );
+    }
+  }
+
+  async logout() {
+    try {
+      const response = await this.client.get(
+        `${this.getBaseURL()}/api/v1/auth/logout`
+      );
+      // The backend will redirect to OIDC provider logout
+      window.location.href = response.data.redirect_url;
+    } catch (error) {
+      throw new Error(error.response?.data?.detail || 'Failed to logout');
+    }
+  }
+}
+
+export const authApi = new RPApi();

@@ -25,18 +25,8 @@ ANALYZE_SYSTEM = """你是一名资深产品经理，负责把用户的一句话
 
 
 # 需求历史回看的最大条数与单条截断长度，避免上下文线性膨胀（research.md R5）。
-# 最新一条放宽到 600 字符（设计文档 S3.3）：长需求 + 指代时，短截断会丢掉
-# 「不要用 CDN」这类关键约束。
 HISTORY_MAX_ITEMS = 6
-HISTORY_ITEM_CHARS = 400
-HISTORY_LATEST_ITEM_CHARS = 600
-
-# 上下文预算（设计文档 2026-09-20 S3.3）：注入上一版 HTML 与续写历史的上限，
-# 防止迭代轮次把 prompt 撑爆导致截断或超时。
-PREVIOUS_HTML_MAX_CHARS = 24_000
-CONTINUE_HISTORY_MAX_CHARS = 12_000
-# 上一版 HTML 超限时保留的尾部长度（页面主体逻辑多在末尾）。
-_PREVIOUS_HTML_TAIL_CHARS = 2_000
+HISTORY_ITEM_CHARS = 200
 
 
 def build_history_block(history_prompts: list[str] | None) -> str:
@@ -44,58 +34,19 @@ def build_history_block(history_prompts: list[str] | None) -> str:
 
     用于让模型理解「继续刚刚的需求」「按之前说的」「再优化一下」这类
     引用上文的指令——否则模型只看到孤立的当前短句，无法还原真实意图。
-    「最新一条」= 切片最后一个元素，即时间上最靠后、当轮指代最可能指向的需求。
     """
     cleaned = [p.strip() for p in (history_prompts or []) if p and p.strip()]
     if not cleaned:
         return ""
-    recent = cleaned[-HISTORY_MAX_ITEMS:]
     lines = [
-        f"{i}. {item[:HISTORY_LATEST_ITEM_CHARS if i == len(recent) else HISTORY_ITEM_CHARS]}"
-        for i, item in enumerate(recent, start=1)
+        f"{i}. {item[:HISTORY_ITEM_CHARS]}"
+        for i, item in enumerate(cleaned[-HISTORY_MAX_ITEMS:], start=1)
     ]
     return (
         "【本项目此前的需求历史（按时间先后，越靠后越新）】\n"
         + "\n".join(lines)
         + "\n\n"
     )
-
-
-def truncate_previous_html(html: str | None) -> str:
-    """上一版 HTML 注入提示词前的预算闸门（S3.3）。
-
-    未超限原样返回；超限则保留 ``<head>`` 段 + 前部内容 + 末尾 2000 字符，
-    中间插入省略标记，让模型仍能看到页面骨架与最新改动。
-    """
-    if not html:
-        return ""
-    if len(html) <= PREVIOUS_HTML_MAX_CHARS:
-        return html
-
-    lower = html.lower()
-    head_end = lower.find("</head>")
-    if 0 <= head_end < 6_000:
-        head = html[: head_end + len("</head>")]
-    else:
-        head = html[:4_000]
-    tail = html[-_PREVIOUS_HTML_TAIL_CHARS:]
-    keep = max(0, PREVIOUS_HTML_MAX_CHARS - len(head) - len(tail) - 64)
-    body = html[len(head): len(head) + keep]
-    omitted = max(0, len(html) - len(head) - len(body) - len(tail))
-    return head + body + f"\n<!-- …已省略 {omitted} 字符… -->\n" + tail
-
-
-def truncate_continue_history(doc: str) -> str:
-    """续写调用 history 中回传已产出文档的预算闸门（S3.3）。
-
-    只回传尾部片段。上限必须大于 pipeline 侧的中断点片段长度
-    （CONTINUE_TAIL_CHARS=2000），否则续写点上下文会被裁掉。
-    """
-    if not doc:
-        return ""
-    if len(doc) <= CONTINUE_HISTORY_MAX_CHARS:
-        return doc
-    return "以下是已输出内容的尾部片段：\n" + doc[-CONTINUE_HISTORY_MAX_CHARS:]
 
 
 ANAPHORA_HINT = (
@@ -214,8 +165,7 @@ def build_code_user(
     if previous_html:
         parts.append(
             "以下是**上一版页面的完整源码**。请在它的基础上改进，"
-            "保留已有功能不要推倒重来，然后叠加本次的新要求：\n\n"
-            + truncate_previous_html(previous_html)
+            "保留已有功能不要推倒重来，然后叠加本次的新要求：\n\n" + previous_html
         )
     parts.append("现在请输出完整的 HTML 源码。")
     return "\n\n".join(parts)

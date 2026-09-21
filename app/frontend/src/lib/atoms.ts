@@ -1,52 +1,13 @@
 /**
  * Atoms Demo 平台的后端 API 封装。
  *
- * 对应 specs/001-atoms-demo/contracts/rest-api.md 与设计文档 2026-09-20（S1/S2/S5）：
+ * 对应 specs/001-atoms-demo/contracts/rest-api.md：
  * - 对外一律使用 public_id，响应中不含自增 id
  * - 统一解析错误信封 {"error": {"code", "message"}}，把 message 作为可展示文案抛出
- * - **匿名身份双通道**：每次请求携带 `X-Atoms-Anon`（localStorage 持久化），
- *   并持久化后端响应里的 `anon_key`。归属键由服务端派生，前端不再自造
- *   owner_key（旧 getOwnerKey() 已删除，客户端无法伪造身份）。
  */
 import { createClient } from '@metagptx/web-sdk';
 
 const client = createClient();
-
-/** 与后端 dependencies/owner.py 常量一致。 */
-const ANON_HEADER = 'X-Atoms-Anon';
-const ANON_STORAGE_KEY = 'atoms_anon_key';
-/** nonce(32) + '.' + sig(16) = 49，超长即非服务端签发值，不持久化。 */
-const ANON_MAX_LEN = 49;
-
-function getStoredAnonKey(): string | null {
-  try {
-    const raw = localStorage.getItem(ANON_STORAGE_KEY);
-    return raw && raw.length <= ANON_MAX_LEN ? raw : null;
-  } catch {
-    return null;
-  }
-}
-
-/** 后端签发的匿名标识（响应体 anon_key）落盘，下次请求经头通道回传。 */
-function persistAnonKey(payload: unknown): void {
-  const raw = (payload as { anon_key?: unknown })?.anon_key;
-  if (typeof raw === 'string' && raw && raw.length <= ANON_MAX_LEN) {
-    try {
-      localStorage.setItem(ANON_STORAGE_KEY, raw);
-    } catch {
-      /* 隐私模式下忽略 */
-    }
-  }
-}
-
-/** 登录态切换时调用：清掉匿名标识，避免与登录身份混用同一浏览器存储。 */
-export function clearAnonKey(): void {
-  try {
-    localStorage.removeItem(ANON_STORAGE_KEY);
-  } catch {
-    /* ignore */
-  }
-}
 
 /** 生成步骤的五态（cancelled：用户主动停止生成）。 */
 export type StepStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -99,13 +60,9 @@ export interface VersionDetail {
   seq: number;
   prompt: string;
   html: string;
-  /** 后端对存储 HTML 计算的 sha256（S5.2）：预览与源码工具条渲染同一个值。 */
-  html_sha256: string;
   summary: Record<string, unknown> | null;
   status: VersionStatus;
   error: string | null;
-  /** 失败分类（S3.5）：auth / rate_limit / timeout / empty / truncated / unknown。 */
-  error_type?: string | null;
   duration_ms: number | null;
   created_at: string | null;
 }
@@ -128,16 +85,7 @@ export interface StepsSnapshot {
   version_seq: number;
   status: VersionStatus;
   error: string | null;
-  /** 失败分类（S3.5），后端 steps 接口从 summary 派生。 */
-  error_type?: string | null;
   steps: GenerationStep[];
-}
-
-/** 回滚响应（S5.1「回滚即新版本」）。 */
-export interface RestoreResult {
-  restored: boolean;
-  version_seq: number;
-  restored_from: number;
 }
 
 /** 三阶段步骤名，前端在提交瞬间即用它本地渲染骨架，不等任何网络往返。 */
@@ -192,26 +140,15 @@ async function invoke<T>(
   data: Record<string, unknown> = {},
   timeout?: number,
 ): Promise<T> {
-  const anonKey = getStoredAnonKey();
-  const headers: Record<string, string> = {};
-  if (anonKey) headers[ANON_HEADER] = anonKey;
-
   try {
     const response = await client.apiCall.invoke({
       url,
       method,
       data,
-      options: {
-        ...(Object.keys(headers).length ? { headers } : {}),
-        ...(timeout ? { timeout } : {}),
-      },
+      ...(timeout ? { options: { timeout } } : {}),
     });
-    // 失败信封也可能带 anon_key（后端保证新访客第一次请求即固化身份）
-    persistAnonKey(response.data);
     return unwrap<T>(response.data);
   } catch (e) {
-    const err = e as { data?: { anon_key?: unknown }; response?: { data?: { anon_key?: unknown } } };
-    persistAnonKey(err?.data ?? err?.response?.data);
     throw toReadableError(e);
   }
 }
@@ -285,19 +222,6 @@ export const atomsApi = {
   ): Promise<{ status: string; version_seq: number }> {
     return invoke(
       `/api/v1/atoms/projects/${publicId}/versions/${seq}/cancel`,
-      'POST',
-    );
-  },
-
-  /**
-   * 回滚到指定历史版本（S5.1，「回滚即新版本」）。
-   *
-   * 后端创建 max(seq)+1 的新版本逐字节复制目标内容，原版本全部保留；
-   * 下一轮生成自动以回滚结果为增量基线。演示项目返回 409。
-   */
-  restoreVersion(publicId: string, seq: number): Promise<RestoreResult> {
-    return invoke(
-      `/api/v1/atoms/projects/${publicId}/versions/${seq}/restore`,
       'POST',
     );
   },

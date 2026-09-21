@@ -17,8 +17,6 @@ interface PromptInputProps {
   onStop?: () => void;
   isGenerating: boolean;
   hasProject: boolean;
-  /** 演示项目只读（S1）：禁用提交并给出提示。 */
-  disabled?: boolean;
 }
 
 const EXAMPLES = [
@@ -34,22 +32,15 @@ export default function PromptInput({
   onStop,
   isGenerating,
   hasProject,
-  disabled,
 }: PromptInputProps) {
   const trimmed = value.trim();
-  const canSubmit = trimmed.length > 0 && !isGenerating && !disabled;
+  const canSubmit = trimmed.length > 0 && !isGenerating;
 
   return (
     <div className="space-y-2.5">
-      {disabled && (
-        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-300">
-          演示项目为只读：可查看预览、源码与对话记录，不能生成或修改。可新建项目开始创作。
-        </div>
-      )}
       <div className="relative">
         <Textarea
           value={value}
-          disabled={disabled}
           onChange={(e) => onChange(e.target.value)}
           placeholder={
             hasProject
