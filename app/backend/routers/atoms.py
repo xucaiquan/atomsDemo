@@ -42,7 +42,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import db_manager, get_db
-from dependencies.owner import ANON_COOKIE, ANON_MAX_AGE, OwnerContext, get_owner
+from dependencies.owner import (
+    ANON_COOKIE,
+    ANON_MAX_AGE,
+    OwnerContext,
+    _issue,
+    anon_cookie_secure,
+    get_owner,
+)
 from models.generation_steps import Generation_steps
 from models.messages import Messages
 from models.projects import Projects
@@ -56,9 +63,12 @@ router = APIRouter(prefix="/api/v1/atoms", tags=["atoms"])
 
 PROMPT_MIN_LEN = 1
 PROMPT_MAX_LEN = 2000
-# 超过该时长仍处于 pending/running 且**无心跳刷新**的版本视为中断。
-# 判据为 updated_at（流水线心跳每 30s 刷新），关系常量：
-# HEARTBEAT_INTERVAL(30s) < STALE_AFTER(10min) < 前端轮询上限(12min)
+# 超过该时长仍处于 pending/running 且 updated_at 未推进的版本视为中断
+# （进程死亡 / 任务消失）。判据是 updated_at，而推进 updated_at 的是流水线
+# 的真实进展点（阶段边界与每次调用落库），不是心跳——心跳已删除。
+# 关系常量（见 services/pipeline.py 顶部与 contracts/generation-lifecycle.md）：
+# STAGE_TIMEOUT(120s) < GENERATION_BUDGET_SECONDS(420s)
+#                      < STALE_AFTER(600s) < 前端轮询上限(720s)
 STALE_AFTER = timedelta(minutes=10)
 
 ERROR_STATUS = {
@@ -85,7 +95,12 @@ class RouteError(Exception):
 def _json(
     payload: Any, ctx: OwnerContext | None = None, status_code: int = 200
 ) -> JSONResponse:
-    """构造响应并附加匿名 cookie（ctx.anon_key 非空时，双通道之一）。"""
+    """构造响应并附加匿名 cookie（ctx.anon_key 非空时，双通道之一）。
+
+    ``secure`` 由请求实际 scheme 推导（见 ``anon_cookie_secure``），HTTPS 下发
+    ``Secure``、本地 HTTP 不下发——写死 Secure 会让本地开发时浏览器不回传 cookie，
+    匿名身份每请求重建，会话恢复根本无法验证。
+    """
     response = JSONResponse(status_code=status_code, content=payload)
     if ctx and ctx.anon_key:
         response.set_cookie(
@@ -94,6 +109,7 @@ def _json(
             max_age=ANON_MAX_AGE,
             httponly=True,
             samesite="lax",
+            secure=anon_cookie_secure(),
             path="/",
         )
     return response
@@ -242,6 +258,11 @@ async def _fetch_version(
 
 # ------------------------------------------------------------------ 陈旧版本恢复
 
+# 回收路径写入的错误分类。必须非空：前端靠它把「这次生成被打断了」与
+# 「上游不可用」「超出时间预算」分开——三者的用户动作不同。
+STALE_ERROR_TYPE = "interrupted"
+STALE_ERROR_MESSAGE = "生成过程被中断（服务重启或连接断开），你的描述已保留，可重新提交"
+
 
 async def _recover_stale_versions(
     db: AsyncSession, owner: str, public_id: str | None = None
@@ -251,9 +272,12 @@ async def _recover_stale_versions(
     设计文档 S1.2 / S3.2 的三点约束：
     1. JOIN Projects 限定 owner_key == owner——消除「任意访客一次列表请求
        触发全表扫描 + 全表 UPDATE」的放大攻击面。
-    2. 判据用 updated_at（流水线心跳每 30s 刷新）而非 created_at，
-       长任务不被误杀；updated_at 缺失的旧数据回退 created_at。
-    3. 残留版本置 failed 并写入面向用户的可读原因，避免永久卡住的加载态。
+    2. 判据用 updated_at 而非 created_at，长任务不被误杀；updated_at 缺失的
+       旧数据回退 created_at。**没有任何后台任务会推进 updated_at**（心跳已删除，
+       见 services/pipeline.py）：它只在流水线的真实进展点前进，所以活任务的
+       最长静默期就是它的总预算，小于 STALE_AFTER。
+    3. 残留版本置 failed 并写入面向用户的可读原因与**非空 error_type**，
+       避免永久卡住的加载态与无法归因的失败。
     """
     stmt = (
         select(Versions)
@@ -277,7 +301,12 @@ async def _recover_stale_versions(
             continue
 
         version.status = "failed"
-        version.error = "生成过程被中断（服务重启或连接断开），你的描述已保留，可重新提交"
+        version.error = STALE_ERROR_MESSAGE
+        # error_type 一并写入：留空会让 get_version_steps 派生出 None，
+        # 前端只能退化成通用文案，无法区分「被打断」与「上游故障」（T033）。
+        existing_summary = _parse_summary(version.summary) or {}
+        existing_summary["error_type"] = STALE_ERROR_TYPE
+        version.summary = json.dumps(existing_summary, ensure_ascii=False)
         changed = True
 
         steps_result = await db.execute(
@@ -348,6 +377,30 @@ async def health(db: AsyncSession = Depends(get_db)):
             "reachable": True,
         },
     }
+
+
+@router.post("/session/logout")
+async def logout():
+    """登出：丢弃浏览器侧的旧匿名身份，并签发一个全新匿名身份。
+
+    响应 ``{"status":"ok","anon_key":"<新值>"}``，并经 ``Set-Cookie`` 一并下发
+    （双通道，与其它 atoms 路由一致——网关吞掉 Set-Cookie 时前端仍能从响应体
+    拿到新身份）。
+
+    **为什么必须由服务端做**：匿名 cookie 是 ``HttpOnly`` 的（刻意的，防 XSS
+    窃取身份），前端 JS 既读不到也删不掉。旧实现里前端 ``clearAnonKey()`` 只清得
+    了 localStorage，cookie 原样留着，下一次请求又回到旧匿名身份——用户看到的
+    现象是「登出无效，还是能看到刚才的东西」。
+
+    **这里刻意不调 ``response.delete_cookie()``**：同 name + 同 path 的
+    ``set_cookie`` 本身就覆盖旧 cookie，删除是冗余的；而多写一条 ``Set-Cookie``
+    会引入顺序陷阱——浏览器按顺序应用同名 cookie，若删除那条排在写入之后，
+    刚签发的新身份会被立刻抹掉。需要的是「换成新身份」，不是「先清空」。
+    """
+    raw = _issue()
+    # 不复用 ctx.anon_key：那是**旧**身份，登出要换的就是它。
+    ctx = OwnerContext(owner_key=f"anon:{raw}", anon_key=raw)
+    return _json({"status": "ok", "anon_key": raw}, ctx)
 
 
 @router.get("/projects")
@@ -627,8 +680,15 @@ async def _start_generation(
     GENERATION_INLINE 环境变量为真时**在当前协程内直接 await** 流水线——
     仅供测试（S4）：轮询后台任务到终态会引入 flaky 与慢测试。生产不设该变量。
     否则创建受跟踪的后台任务，注册到任务表以支持取消，并防止 task 被 GC 提前回收。
+
+    真值判定**必须按严格口径**，不能写成 ``if os.getenv("GENERATION_INLINE")``：
+    ``os.getenv`` 返回字符串，``"0"``/``"false"``/``"no"`` 全是真值，而
+    ``start_app_v2.sh`` 会把 env 文件里每一行 ``KEY=VALUE`` 都 export 进后端进程。
+    于是开发者在 ``app/.env`` 里写 ``GENERATION_INLINE=0`` 想关掉这个逃生舱，
+    反而会打开它——``generate`` 在请求内 await 整条 1~4 分钟的流水线，撞上网关
+    约 120s 的代理读超时。口径与 ``routers/auth.py`` 的 ``LOCAL_PATCH`` 一致。
     """
-    if os.getenv("GENERATION_INLINE"):
+    if os.getenv("GENERATION_INLINE", "").strip().lower() in ("1", "true"):
         await _run_generation_in_background(
             public_id, version_seq, prompt, previous_html, history_prompts
         )
@@ -740,11 +800,18 @@ async def get_version_steps(
     db: AsyncSession = Depends(get_db),
     ctx: OwnerContext = Depends(get_owner),
 ):
-    """轮询用：返回某版本的实时步骤状态与版本状态。"""
+    """轮询用：返回某版本的实时步骤状态与版本状态。
+
+    这里也要触发陈旧回收（contracts/rest-api.md 变更 1）：前端在「进行中」时
+    **只轮询这个端点**，回收若只挂在列表/详情上，一个刷新后不再经过列表的会话会
+    永久停留在「生成中」——那正是本特性要消灭的失败形态。归属限定与其它路由一致。
+    """
     try:
         await _require_project(db, public_id, ctx, write=False)
     except RouteError as exc:
         return error_envelope(exc.code, exc.message, ctx)
+
+    await _recover_stale_versions(db, ctx.owner_key, public_id)
 
     version = await _fetch_version(db, public_id, seq)
     if not version:

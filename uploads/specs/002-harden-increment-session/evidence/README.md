@@ -1,25 +1,36 @@
-# 002-harden-increment-session 证据留档
+# 验收证据留档
 
-本目录存放特性 `002-harden-increment-session`（增量可靠性与会话连续性加固）的验收证据。
+本目录存放 `002-harden-increment-session` 的可复跑验证证据。
 
 ## 命名约定
 
-`<日期>-<被测版本>-<场景>.txt`
+```
+<日期>-<被测版本>-<场景>.txt|.md
+```
 
-- `<日期>`：采集日期，格式 `YYYYMMDD`
-- `<被测版本>`：被测代码状态标识（如 `baseline` 改动前基线、`final` 最终全绿）
-- `<场景>`：场景名（见下）
+- `<日期>`：`YYYY-MM-DD`
+- `<被测版本>`：git 短哈希，或 `local` 表示未提交的工作区
+- `<场景>`：见下表
 
-## 必留场景（三个）
+## 三个必留场景
 
-1. **本地回归**：`cd app/backend && python -m pytest tests/ -q` 的完整输出（含用例名与统计行）。
-2. **线上探针**：`app/backend/probe_upstream.py` / `app/backend/e2e_two_round.py` 的运行输出
-   （消耗真实模型配额；配额不足时保留失败输出并注明原因）。
-3. **两轮端到端**：两轮增量生成 + 旧功能保留的产物级核对输出。
+| 场景 | 来源 | 成本 | 断言口径 |
+|---|---|---|---|
+| 本地回归 | `cd app/backend && .venv/Scripts/python -m pytest tests/ -q` | 零 | 0 failed / 0 errors（SC-011） |
+| 线上探针 | `app/backend/probe_upstream.py` | **消耗配额** | 区分「上游拒绝了某阶段载荷」与「流水线自身问题」 |
+| 两轮端到端 | `app/backend/e2e_two_round.py` | **消耗配额** | 两轮均达终态、产物级旧功能保留、会话恢复（SC-001/002/007/008/012） |
 
-## 与任务文档的谱系差异说明
+## 重要：运行环境
 
-任务文档假设仓库存在 `tests/test_generation_inline.py`（3 红）、`tests/test_fake_aihub.py`（1 红）、
-`tests/test_conftest_smoke.py`（2 error）及 `bd78a46` 合并产物；当前仓库经核查**不存在**这些文件
-（`app/backend/tests/` 仅含 7 个既有测试文件），因此 T008 的「修复 6 个身份无关红灯」在本仓库
-无对应对象，T039 所列探针中间 JSON 亦不存在。基线以本仓库真实状态录制（见 baseline-tests.txt）。
+后端测试**必须用 venv 里的 Python**。系统 Python（`AppData/Local/Programs/Python/Python312`）没有装 pytest：
+
+```bash
+cd app/backend
+.venv/Scripts/python.exe -m pytest tests/ -q
+```
+
+必须用 `python -m pytest`（仓库根无 conftest/pyproject，靠 `-m` 把 CWD 放进 `sys.path`；直接 `pytest` 会 ImportError）。
+
+## 副作用告知
+
+线上场景（探针 / 端到端）会创建真实项目并消耗模型配额。运行前请确认成本可接受，并知会相关方。

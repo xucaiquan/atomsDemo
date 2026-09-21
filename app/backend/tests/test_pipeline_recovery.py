@@ -7,6 +7,7 @@ GENERATION_INLINE=1 让受理接口在当前协程内跑完流水线：post(gene
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from sqlalchemy import select
@@ -92,27 +93,37 @@ async def test_happy_path_succeeds(http, inject_fake_ai):
 
 
 async def test_rate_limit_retries_then_succeeds(http, inject_fake_ai):
-    """429 一次后重试成功：版本终态 succeeded，共 4 次调用（T003 收紧为最多 2 次尝试）。"""
+    """429 用掉全部重试额度之前成功：版本终态 succeeded。
+
+    尝试次数从 ``MAX_ATTEMPTS`` 推导（不是写死的 3）：重试额度是预算约束下的
+    可调参数，写死会让「重试一次就成功」这类用例在额度调整后静默失去意义。
+    """
+    retries = pipeline_module.MAX_ATTEMPTS - 1
     client = http()
     async with client:
         pid = await _create_project(client)
         fake = inject_fake_ai(
             FakeAIHub(
-                [ANALYSIS_JSON, DESIGN_JSON, RateLimitError("429"), make_html("x")]
+                [ANALYSIS_JSON, DESIGN_JSON]
+                + [RateLimitError("429")] * retries
+                + [make_html("x")]
             )
         )
         seq = (await _generate(client, pid, "做一个待办")).json()["version_seq"]
         assert (await _version_detail(client, pid, seq)).json()["status"] == "succeeded"
-        assert len(fake.requests) == 4
+        # 阶段 1 + 阶段 2 + 失败重试 + 成功那一次
+        assert len(fake.requests) == 3 + retries
 
 
 async def test_rate_limit_exhausted_marks_failed(http, inject_fake_ai):
+    """429 耗尽全部重试额度 → failed，且 attempts/upstream_status 可观测（S3.5）。"""
     client = http()
     async with client:
         pid = await _create_project(client)
         fake = inject_fake_ai(
             FakeAIHub(
-                [ANALYSIS_JSON, DESIGN_JSON] + [RateLimitError("429")] * 2
+                [ANALYSIS_JSON, DESIGN_JSON]
+                + [RateLimitError("429")] * pipeline_module.MAX_ATTEMPTS
             )
         )
         seq = (await _generate(client, pid, "做一个待办")).json()["version_seq"]
@@ -120,9 +131,9 @@ async def test_rate_limit_exhausted_marks_failed(http, inject_fake_ai):
         assert detail["status"] == "failed"
         assert detail["error_type"] == "rate_limit"  # S3.5 可观测
         assert detail["summary"]["upstream_status"] == 429
-        assert detail["summary"]["attempts"] == 2
+        assert detail["summary"]["attempts"] == pipeline_module.MAX_ATTEMPTS
         assert "限流" in detail["error"]  # 面向用户的可读中文
-        assert len(fake.requests) == 4  # 1 + 2 次尝试
+        assert len(fake.requests) == 2 + pipeline_module.MAX_ATTEMPTS
         steps = (
             await client.get(f"/api/v1/atoms/projects/{pid}/versions/{seq}/steps")
         ).json()["steps"]
@@ -161,7 +172,8 @@ async def test_stage_timeout_classified_as_timeout(http, inject_fake_ai, monkeyp
         pid = await _create_project(client)
         inject_fake_ai(
             FakeAIHub(
-                [ANALYSIS_JSON, DESIGN_JSON] + [lambda req: slow()] * 3
+                [ANALYSIS_JSON, DESIGN_JSON]
+                + [lambda req: slow()] * pipeline_module.MAX_ATTEMPTS
             )
         )
         seq = (await _generate(client, pid, "做一个待办")).json()["version_seq"]
@@ -175,25 +187,36 @@ async def test_stage_timeout_classified_as_timeout(http, inject_fake_ai, monkeyp
 
 
 async def test_empty_content_retries_with_lower_max_tokens(http, inject_fake_ai):
-    """首次空内容后降级 max_tokens（16384→8192）重试并成功（最多 2 次尝试）。"""
+    """空内容会重试，且重试时 max_tokens 降级（16384→8192）。
+
+    空内容次数取 ``MAX_ATTEMPTS - 1``（即用满重试额度之前的全部空响应），
+    这样额度调整后本用例仍然表达「尽可能多地空、最后一次成功」的原意。
+    """
+    empties = pipeline_module.MAX_ATTEMPTS - 1
     client = http()
     async with client:
         pid = await _create_project(client)
+        # 首个空响应故意用纯空白（验证 .strip() 生效），其余用空串
+        blank_responses = ["   "] + [""] * max(empties - 1, 0)
         fake = inject_fake_ai(
-            FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, "   ", make_html("ok")])
+            FakeAIHub([ANALYSIS_JSON, DESIGN_JSON] + blank_responses + [make_html("ok")])
         )
         seq = (await _generate(client, pid, "做一个待办")).json()["version_seq"]
         assert (await _version_detail(client, pid, seq)).json()["status"] == "succeeded"
-        assert len(fake.requests) == 4
+        assert len(fake.requests) == 2 + empties + 1
         assert fake.requests[2].max_tokens == 16384  # 第一次代码调用
-        assert fake.requests[3].max_tokens == 8192  # 降级后
+        assert fake.requests[-1].max_tokens == 8192  # 降级后
 
 
 async def test_all_empty_content_fails_as_empty(http, inject_fake_ai):
     client = http()
     async with client:
         pid = await _create_project(client)
-        inject_fake_ai(FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, "", "", ""]))
+        inject_fake_ai(
+            FakeAIHub(
+                [ANALYSIS_JSON, DESIGN_JSON] + [""] * pipeline_module.MAX_ATTEMPTS
+            )
+        )
         seq = (await _generate(client, pid, "做一个待办")).json()["version_seq"]
         detail = (await _version_detail(client, pid, seq)).json()
         assert detail["status"] == "failed"
@@ -322,3 +345,151 @@ async def test_late_success_does_not_overwrite_cancelled(http, inject_fake_ai):
         detail = (await _version_detail(client, pid_holder["pid"], seq)).json()
         assert detail["status"] == "cancelled"
         assert not detail["html"]  # 迟到的结果没有落库
+
+
+# ------------------------------------------------------------------ 内部故障（非上游）
+
+
+@pytest.mark.parametrize("fail_at_stage", [1, 2])
+async def test_internal_error_is_attributed_to_actual_stage(
+    http, inject_fake_ai, monkeypatch, fail_at_stage
+):
+    """本地代码故障必须归因到**流水线实际所在阶段**，且不留 running 步骤。
+
+    FR-014 / FR-015 / SC-005。注入点是 ``_call_step`` 中**重试 try 之外**的
+    ``GenTxtRequest`` 构造处——那些语句刻意留在 try 外（research.md R-4），
+    以免我们自己的故障被误分类成「可重试的上游错误」；代价是它们由
+    ``_run_stages`` 的通用兜底接管，因此兜底的归因必须准确。
+
+    参数取 1 与 2 是关键：阶段 3 是旧实现的硬编码默认值，只有在**非 3** 的阶段
+    出错才能区分「真的归因」与「恰好蒙对」。
+    """
+    original = pipeline_module.GenTxtRequest
+    calls = {"n": 0}
+
+    def _exploding(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == fail_at_stage:
+            raise RuntimeError("模拟本地代码故障（非上游错误）")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "GenTxtRequest", _exploding)
+
+    client = http()
+    async with client:
+        pid = await _create_project(client)
+        inject_fake_ai(FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, make_html("x")]))
+        seq = (await _generate(client, pid, "做一个待办")).json()["version_seq"]
+
+        detail = (await _version_detail(client, pid, seq)).json()
+        assert detail["status"] == "failed"
+        assert detail["error_type"], "失败必须带可区分的 error_type"
+        assert "Traceback" not in detail["error"], "用户文案不得含堆栈"
+
+        # 归因（SC-005）：失败标记必须落在真正出错的阶段上
+        summary = detail["summary"]
+        assert summary.get("attempts") is not None, "通用兜底未补齐 attempts"
+        assert "RuntimeError" in json.dumps(summary), "summary 未记录异常类名"
+
+        steps = (
+            await client.get(f"/api/v1/atoms/projects/{pid}/versions/{seq}/steps")
+        ).json()["steps"]
+        statuses = [s["status"] for s in steps]
+
+        # FR-015 / INV-S2：不得残留 running 步骤
+        assert "running" not in statuses, f"存在残留 running 步骤：{statuses}"
+        assert statuses[fail_at_stage - 1] == "failed", (
+            f"失败未归因到阶段 {fail_at_stage}（疑似仍硬编码到阶段 3）：{statuses}"
+        )
+        for i in range(fail_at_stage - 1):
+            assert statuses[i] == "succeeded", f"阶段 {i + 1} 本应已完成：{statuses}"
+        # 尚未开始的阶段不该被清扫波及（只有 running 才转 failed）
+        for i in range(fail_at_stage, len(statuses)):
+            assert statuses[i] == "pending", f"阶段 {i + 1} 未启动却被改写：{statuses}"
+
+
+# ------------------------------------------------------------------ 失败记录完整性
+
+
+def _fault_sequence(kind: str) -> list:
+    """按故障类别构造上游响应序列（阶段 1、2 恒成功，故障从阶段 3 起）。"""
+    if kind == "rate_limit":
+        return [ANALYSIS_JSON, DESIGN_JSON] + [
+            RateLimitError("429")
+        ] * pipeline_module.MAX_ATTEMPTS
+    if kind == "auth":
+        return [ANALYSIS_JSON, DESIGN_JSON, PermissionDeniedError("403 insufficient balance")]
+    if kind == "upstream_5xx":
+        return [ANALYSIS_JSON, DESIGN_JSON] + [
+            InternalServerError("503")
+        ] * pipeline_module.MAX_ATTEMPTS
+    if kind == "truncated":
+        # 给足截断片段：够跑满「2 轮主调用 × 各 2 次续写」并有余量，
+        # 免得因序列耗尽而失败成别的类别、把用例变成假绿。
+        return [ANALYSIS_JSON, DESIGN_JSON] + [
+            f"<!DOCTYPE html>\n<html>\n<body><p>半截{i}" for i in range(12)
+        ]
+    if kind == "empty":
+        return [ANALYSIS_JSON, DESIGN_JSON] + [""] * pipeline_module.MAX_ATTEMPTS
+    raise AssertionError(f"未知故障类别：{kind}")
+
+
+FAULT_CASES = [
+    ("rate_limit", "rate_limit"),
+    ("auth", "auth"),
+    ("upstream_5xx", "upstream_5xx"),
+    ("truncated", "truncated"),
+    ("empty", "empty"),
+]
+
+
+@pytest.mark.parametrize("kind,expected_error_type", FAULT_CASES)
+async def test_every_fault_class_leaves_a_complete_failure_record(
+    http, inject_fake_ai, kind, expected_error_type
+):
+    """五类故障都要落到「明确终态 + 完整记录」，且不留脏状态。
+
+    FR-013 / FR-016 / FR-017 / SC-004。既有用例各自只断言了记录的一个片段
+    （有的只查 error_type，有的只查 upstream_status），本用例补齐**共同不变量**：
+    终态、用户可读且不含堆栈的文案、html 为空、无残留 running 步骤、未产生多余版本。
+    这些恰恰是「失败之后用户还能立刻重来」的前提。
+    """
+    client = http()
+    async with client:
+        pid = await _create_project(client)
+        fake = inject_fake_ai(FakeAIHub(_fault_sequence(kind)))
+        seq = (await _generate(client, pid, "做一个待办")).json()["version_seq"]
+
+        detail = (await _version_detail(client, pid, seq)).json()
+
+        # —— 共同不变量 ——
+        assert detail["status"] == "failed", f"{kind} 未落到终态"
+        assert detail["error"], f"{kind} 缺少用户可读文案"
+        assert "Traceback" not in detail["error"], f"{kind} 文案泄漏了堆栈"
+        assert ".py" not in detail["error"], f"{kind} 文案泄漏了内部路径"
+        assert detail["html"] == "", f"{kind} 失败版本不该有 html"
+        assert detail["error_type"] == expected_error_type
+
+        steps = (
+            await client.get(f"/api/v1/atoms/projects/{pid}/versions/{seq}/steps")
+        ).json()["steps"]
+        statuses = [s["status"] for s in steps]
+        assert "running" not in statuses, f"{kind} 残留 running 步骤：{statuses}"
+        assert statuses[2] == "failed", f"{kind} 阶段 3 未标记失败：{statuses}"
+
+        project = (await client.get(f"/api/v1/atoms/projects/{pid}")).json()
+        assert project["version_count"] == 1, f"{kind} 产生了多余版本"
+        assert project["latest_status"] == "failed"
+
+        # —— 各类别额外要求的记录字段 ——
+        summary = detail["summary"]
+        if kind == "rate_limit":
+            assert summary["attempts"] == pipeline_module.MAX_ATTEMPTS
+            assert summary["upstream_status"] == 429
+        elif kind == "auth":
+            # 鉴权失败立即失败：只消耗 1 次尝试，不做无谓重试
+            assert summary["attempts"] == 1, "鉴权失败不该重试"
+            assert len(fake.requests) == 3, "鉴权失败后仍发起了额外调用"
+        elif kind == "upstream_5xx":
+            assert summary["upstream_status"] == 503
+

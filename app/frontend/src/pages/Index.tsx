@@ -60,8 +60,56 @@ const ERROR_TYPE_LABELS: Record<string, string> = {
   timeout: '上游响应超时',
   empty: '上游返回空内容',
   truncated: '输出被截断',
+  // 平台侧止损：不是上游故障，措辞必须与 timeout 明确区分（FR-017）。
+  budget_exhausted: '超出时间预算',
+  // 陈旧回收写入的分类：服务重启或连接断开导致的中断。
+  interrupted: '生成被中断',
   unknown: '未知错误',
 };
+
+/**
+ * 每一类失败对应的**下一步动作**（FR-017：失败说明必须给出可理解的原因与出口）。
+ *
+ * 「超出时间预算」与「上游不可用」的区别必须落到用户动作上：前者重试同样会
+ * 超预算，必须精简需求；后者是上游自己会恢复的，稍后重试即可。只把两种说法
+ * 并列展示而不说清该做什么，用户仍会一直重试一个注定失败的请求。
+ */
+const ERROR_TYPE_HINTS: Record<string, string> = {
+  budget_exhausted: '可精简描述或拆成两步后再试，重试同样的描述很可能再次超时',
+  interrupted: '重新提交即可继续，之前的成功版本不受影响',
+  auth: '需要管理员处理，重试无用',
+  truncated: '描述里包含的内容过多，精简后重试',
+  empty: '直接重新提交即可，通常是上游偶发空响应',
+  rate_limit: '上游繁忙，稍后重试即可',
+  timeout: '上游暂时不响应，稍后重试即可',
+  unknown: '稍后重试即可',
+};
+
+/**
+ * 上次打开的项目标识（FR-026：刷新后回到原来的地方）。
+ *
+ * 只存 public_id，不存项目内容——内容必须重新从服务端取，避免拿本地副本
+ * 冒充服务端状态。归属校验仍在服务端：恢复时若该 id 不属于当前身份（换了
+ * 身份、登出后又刷新），详情请求会 404，此时静默丢弃即可。
+ */
+const LAST_PROJECT_KEY = 'atoms_last_project';
+
+function readLastProjectId(): string | null {
+  try {
+    return localStorage.getItem(LAST_PROJECT_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeLastProjectId(publicId: string | null): void {
+  try {
+    if (publicId) localStorage.setItem(LAST_PROJECT_KEY, publicId);
+    else localStorage.removeItem(LAST_PROJECT_KEY);
+  } catch {
+    /* 隐私模式下忽略 */
+  }
+}
 
 export default function Index() {
   const { user, status: authStatus, login, logout } = useAuth();
@@ -79,6 +127,8 @@ export default function Index() {
   const [steps, setSteps] = useState<GenerationStep[]>([]);
   const [failedMessage, setFailedMessage] = useState<string | null>(null);
   const [failedType, setFailedType] = useState<string | null>(null);
+  // 本次提交的描述：失败后的一键重试据此复用（输入框在受理时已被清空）
+  const [submittedPrompt, setSubmittedPrompt] = useState('');
   const [html, setHtml] = useState('');
   // 当前展示版本的 SHA-256（S5.2：预览与源码工具条渲染同一个值）
   const [htmlSha256, setHtmlSha256] = useState('');
@@ -178,9 +228,45 @@ export default function Index() {
   }, [authStatus, user, resetWorkspace, refreshProjects]);
 
   const handleLogout = useCallback(async () => {
+    // 两件事都得做，缺一不可：
+    // ① atomsApi.logout() 轮换**浏览器侧的匿名身份**。不能省——匿名 cookie 是
+    //    HttpOnly 的，前端只能清掉 localStorage 里那份副本，cookie 原样留着，
+    //    请求到达服务端时身份还是旧的（用户看到「登出无效，还看得到刚才的东西」）。
+    // ② useAuth().logout() 清掉登录态。
+    try {
+      await atomsApi.logout();
+    } catch {
+      // 匿名身份轮换失败不能阻断登出：①失败时仍要完成 ②，否则用户困在登录态。
+    }
     await logout();
     // logout() 会把状态切到 anonymous，上面的身份 effect 负责清态与重拉
   }, [logout]);
+
+  // ---------------- 刷新恢复：回到上次打开的项目（FR-026） ----------------
+  // 刷新后 activeId 初始为 null，工作区是空的——用户得自己再从列表里找回来。
+  // 这里在身份与项目列表都就绪后自动载入上次打开的项目；若该项目不属于当前
+  // 身份（登出过 / 换了身份）或已被删除，列表里就找不到它，直接丢弃记录。
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current || activeId) return;
+    if (authStatus === 'loading' || projectsLoading) return;
+    const stored = readLastProjectId();
+    if (!stored) return;
+    restoredRef.current = true;
+    if (!projects.some((p) => p.public_id === stored)) {
+      // 列表里没有：不属于当前身份或已被删除。丢弃记录，避免每次渲染重试。
+      writeLastProjectId(null);
+      return;
+    }
+    void openProject(stored);
+  }, [activeId, authStatus, projectsLoading, projects, openProject]);
+
+  // 把「当前打开的项目」记到浏览器侧，供刷新后恢复（FR-026）。
+  // activeId 置空（resetWorkspace）时会一并删除记录——换身份后不该再恢复
+  // 上一个身份的项目。
+  useEffect(() => {
+    writeLastProjectId(activeId);
+  }, [activeId]);
 
   // ---------------- 版本切换（US3 / FR-007 / S5.3） ----------------
   const switchVersion = useCallback(
@@ -200,6 +286,9 @@ export default function Index() {
         if (full.status === 'failed') {
           setFailedMessage(full.error);
           setFailedType(full.error_type || null);
+          // 版本里持久化着这一轮的原始描述（FR-019）：刷新后重新打开项目时，
+          // 「用原描述重新生成」据它可用——否则重试入口会因记忆丢失而失效。
+          setSubmittedPrompt(full.prompt || '');
         }
         const version = detail?.versions.find((v) => v.seq === seq);
         if (version) setSteps(version.steps);
@@ -331,54 +420,72 @@ export default function Index() {
   }, []);
 
   // ---------------- 提交生成（US1 + US3，异步受理） ----------------
-  const handleSubmit = useCallback(async () => {
-    const text = prompt.trim();
-    if (!text || isGenerating) return;
-    setFailedMessage(null);
-    setFailedType(null);
-    setIsGenerating(true);
-    setView('preview');
 
-    // ① 提交瞬间本地渲染步骤骨架 —— 不等待任何网络往返（SC-002）
-    setSteps(buildLocalSteps());
-
-    try {
-      // ② 无项目时先创建空项目
-      let publicId = activeId;
-      if (!publicId) {
-        const created = await atomsApi.createProject();
-        publicId = created.public_id;
-        setActiveId(publicId);
-      }
-
-      // ③ 受理生成：后端只做校验 + 落库，毫秒级返回 202 + version_seq。
-      const accepted = await atomsApi.generate(publicId, text);
-      generatingSeqRef.current = accepted.version_seq;
-      setPrompt('');
-      if (accepted.steps?.length) setSteps(accepted.steps);
-
-      // ④ 轮询后台任务直到终态（含 cancelled），再取 HTML 渲染
-      const snapshot = await awaitGeneration(publicId, accepted.version_seq);
-      setIsGenerating(false);
-      generatingSeqRef.current = null;
-      await finishGeneration(publicId, snapshot);
-    } catch (e) {
-      stopPolling();
-      setIsGenerating(false);
-      const error = e as Error & { code?: string };
-      // 受理前的校验错误（400/403/404/409）：输入保留（FR-011），骨架回退失败态
-      setFailedMessage(error.message || '生成失败，请稍后重试');
+  /**
+   * 以给定描述跑一次生成。与 `prompt` 输入框解耦，供「重新生成」入口复用
+   * （FR-017 的重试入口：重试必须能带上**原描述**，而不是要求用户重打一遍）。
+   */
+  const runGeneration = useCallback(
+    async (text: string) => {
+      if (!text || isGenerating) return;
+      setFailedMessage(null);
       setFailedType(null);
-      toast.error(error.message || '生成失败，你的描述已保留');
-      setSteps((prev) =>
-        prev.map((s, i) =>
-          s.status === 'running' || i === 0
-            ? { ...s, status: 'failed', output: error.message }
-            : s,
-        ),
-      );
-    }
-  }, [prompt, isGenerating, activeId, awaitGeneration, finishGeneration, stopPolling]);
+      // 记住本次提交的描述：失败后据此提供重试入口（FR-017/FR-019）
+      setSubmittedPrompt(text);
+      setIsGenerating(true);
+      setView('preview');
+
+      // ① 提交瞬间本地渲染步骤骨架 —— 不等待任何网络往返（SC-002）
+      setSteps(buildLocalSteps());
+
+      try {
+        // ② 无项目时先创建空项目
+        let publicId = activeId;
+        if (!publicId) {
+          const created = await atomsApi.createProject();
+          publicId = created.public_id;
+          setActiveId(publicId);
+        }
+
+        // ③ 受理生成：后端只做校验 + 落库，毫秒级返回 202 + version_seq。
+        const accepted = await atomsApi.generate(publicId, text);
+        generatingSeqRef.current = accepted.version_seq;
+        setPrompt('');
+        if (accepted.steps?.length) setSteps(accepted.steps);
+
+        // ④ 轮询后台任务直到终态（含 cancelled），再取 HTML 渲染
+        const snapshot = await awaitGeneration(publicId, accepted.version_seq);
+        setIsGenerating(false);
+        generatingSeqRef.current = null;
+        await finishGeneration(publicId, snapshot);
+      } catch (e) {
+        stopPolling();
+        setIsGenerating(false);
+        const error = e as Error & { code?: string };
+        // 受理前的校验错误（400/403/404/409）：输入保留（FR-011），骨架回退失败态
+        setFailedMessage(error.message || '生成失败，请稍后重试');
+        setFailedType(null);
+        toast.error(error.message || '生成失败，你的描述已保留');
+        setSteps((prev) =>
+          prev.map((s, i) =>
+            s.status === 'running' || i === 0
+              ? { ...s, status: 'failed', output: error.message }
+              : s,
+          ),
+        );
+      }
+    },
+    [isGenerating, activeId, awaitGeneration, finishGeneration, stopPolling],
+  );
+
+  const handleSubmit = useCallback(() => {
+    void runGeneration(prompt.trim());
+  }, [prompt, runGeneration]);
+
+  /** 失败后的一键重试：原描述直接复用（FR-017/FR-019）。 */
+  const handleRetry = useCallback(() => {
+    void runGeneration(submittedPrompt);
+  }, [submittedPrompt, runGeneration]);
 
   // ---------------- 刷新恢复：接回进行中的后台生成 ----------------
   // 页面刷新 / 浏览器关闭后重新打开时，若项目存在 pending/running 版本
@@ -590,7 +697,30 @@ export default function Index() {
           <div className="shrink-0 border-t border-slate-800/80 p-3">
             {failedMessage && !isGenerating && (
               <div className="mb-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-[11px] leading-relaxed text-rose-300">
-                {failedMessage}（你的描述已保留，可直接重试）
+                <div className="flex items-start gap-2">
+                  <span className="min-w-0 flex-1">
+                    {failedMessage}
+                    {/* 分类标签：让「超出时间预算」（平台侧止损）与
+                        「上游响应超时」（上游不响应）在界面上即可区分 */}
+                    {failedType && (
+                      <span className="ml-1.5 rounded border border-rose-500/30 px-1 py-0.5 font-mono text-[10px]">
+                        {ERROR_TYPE_LABELS[failedType] || failedType}
+                      </span>
+                    )}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleRetry}
+                    disabled={!submittedPrompt || isDemoProject}
+                    className="shrink-0 rounded border border-rose-400/40 bg-rose-500/20 px-2 py-0.5 font-medium text-rose-100 transition-colors hover:bg-rose-500/30 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    用原描述重新生成
+                  </button>
+                </div>
+                <div className="mt-1 text-rose-400/90">
+                  {ERROR_TYPE_HINTS[failedType || ''] ||
+                    '你的描述已保留，可直接重新生成'}
+                </div>
               </div>
             )}
             <PromptInput
