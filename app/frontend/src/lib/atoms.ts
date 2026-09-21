@@ -39,7 +39,17 @@ function persistAnonKey(payload: unknown): void {
   }
 }
 
-/** 登录态切换时调用：清掉匿名标识，避免与登录身份混用同一浏览器存储。 */
+/**
+ * 只清 localStorage 里的匿名标识副本。
+ *
+ * **这不等于登出。** 身份的主通道是 HttpOnly cookie，前端 JS 原理上读不到也
+ * 删不掉它；清掉 localStorage 只让请求头通道不再携带旧标识，请求到达服务端时
+ * 仍会带上旧 cookie，于是身份还是旧的。旧代码把本函数当登出用，用户看到的现象
+ * 就是「登出无效」。要真正换身份，必须走 `atomsApi.logout()`（服务端下发新身份）。
+ *
+ * 保留本函数是给「登录态切换」用的：登录身份的优先级高于匿名身份，此时清掉
+ * 匿名副本可以避免与登录身份混用同一份浏览器存储。
+ */
 export function clearAnonKey(): void {
   try {
     localStorage.removeItem(ANON_STORAGE_KEY);
@@ -104,7 +114,12 @@ export interface VersionDetail {
   summary: Record<string, unknown> | null;
   status: VersionStatus;
   error: string | null;
-  /** 失败分类（S3.5）：auth / rate_limit / timeout / empty / truncated / unknown。 */
+  /**
+   * 失败分类（S3.5）。两类含义不同，界面文案必须区分开（FR-017）：
+   * - 上游故障：auth / rate_limit / timeout / upstream_5xx / empty / truncated / unknown
+   * - 平台侧止损：budget_exhausted（超出整体时间预算，重试同样会超，需精简需求）
+   * - 被中断：interrupted（服务重启或连接断开后的陈旧回收）
+   */
   error_type?: string | null;
   duration_ms: number | null;
   created_at: string | null;
@@ -300,5 +315,27 @@ export const atomsApi = {
       `/api/v1/atoms/projects/${publicId}/versions/${seq}/restore`,
       'POST',
     );
+  },
+
+  /**
+   * 登出：换取全新匿名身份，返还服务端签发的新 `anon_key`（失败时为 null）。
+   *
+   * 必须打后端——匿名 cookie 是 HttpOnly 的，前端 JS 删不掉它（见 clearAnonKey
+   * 的说明）。服务端会覆盖旧 cookie 并签发新身份，双通道一并下发。
+   *
+   * 顺序有意为之：**先清本地、再发请求**。这样即便请求失败，请求头通道也不会
+   * 继续携带旧标识，不会退化成「旧身份被两个通道同时续用」；此时 cookie 通道
+   * 仍归服务端管，前端无能为力，属于已知边界。
+   *
+   * 新身份由 invoke 内的 persistAnonKey 落盘（响应体同样带 anon_key），
+   * 于是请求头通道与 cookie 通道保持一致，都指向登出后的新身份。
+   */
+  async logout(): Promise<string | null> {
+    clearAnonKey();
+    const data = await invoke<{ status: string; anon_key?: string }>(
+      '/api/v1/atoms/session/logout',
+      'POST',
+    );
+    return data.anon_key ?? null;
   },
 };

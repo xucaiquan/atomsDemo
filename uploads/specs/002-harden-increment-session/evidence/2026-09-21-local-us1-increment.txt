@@ -1,0 +1,152 @@
+US1（同项目两轮增量 + 旧功能保留）本地证据
+日期：2026-09-21
+环境：Windows 11 / app/backend/.venv / python -m pytest，全部离线（无线上调用、不消耗模型配额）
+对应任务：T009 T010 T011 T012 T013 T014
+
+============================================================
+1. 测试结果
+============================================================
+
+$ cd app/backend && python -m pytest tests/ -q
+4 failed, 117 passed, 4 warnings in 4.82s
+
+剩余 4 条失败全部属于 US2（owner/身份）范围，即 T015–T018：
+  tests/test_owner_dependency.py::test_verify_rejects_client_made_key
+  tests/test_owner_dependency.py::test_verify_rejects_non_canonical_shape
+  tests/test_owner_dependency.py::test_distinct_long_subjects_yield_distinct_keys
+  tests/test_owner_dependency.py::test_missing_secret_warns_once
+
+基线（本次改动前）：8 failed, 90 passed, 2 errors
+当前：4 failed, 117 passed, 0 errors
+→ 净增 27 条通过用例，2 个 error 清零。
+
+$ python -m pytest tests/test_two_round_increment.py tests/test_time_budget_invariants.py tests/test_generation_inline.py -q
+27 passed
+
+============================================================
+2. T009 增量基线 = 最近一个**成功**版本（FR-002）
+============================================================
+
+用例：tests/test_two_round_increment.py
+  - test_baseline_is_round1_output_when_round2_failed
+  - test_baseline_is_newest_succeeded_not_oldest
+
+第一条构造「第 1 轮成功 → 第 2 轮阶段 3 鉴权失败 → 第 3 轮请求」，
+断言第 3 轮注入的 previous_html 是第 1 轮产出（"基线v1"），且失败轮次的
+需求不进历史。第二条是更强的判别式：两轮都成功时基线必须是**较新**那一版
+（"第2版" 在场且 "第1版" 不在场）——「取第一个成功版本」这类写错方向的选择
+能通过第一条，却会在第二条露馅。
+
+============================================================
+3. T010 指代消解提示真的被注入
+============================================================
+
+用例：test_anaphora_hint_reaches_the_stages_that_see_the_raw_prompt
+
+注意：本用例的断言范围经过修正，理由已写入用例 docstring。
+ANAPHORA_HINT 只注入阶段 1（build_analyze_user）与阶段 3（build_code_user），
+不注入阶段 2（build_design_user）——这是实现里刻意的分工，不是遗漏：
+
+  * 阶段 1 拿到的是原始需求文本，「继续刚刚的需求」这句指代在这里第一次出现；
+  * 阶段 3 拿到的又是原始需求文本（代码照它写），误读指代会直接丢旧功能；
+  * 阶段 2 是唯一不直接读原始需求、而读阶段 1 **已解析好的分析结果**的阶段，
+    指代在阶段 1 已消解完毕并以「阶段一的需求分析结果」的形式作为它的输入；
+    它的延续性由 build_design_user 的迭代框架承担（「请设计在其基础上改进的
+    结构，明确指出哪些区域保留、哪些区域新增」）。
+
+据 trap #3（不得为让测试变绿而改动被测实现），此处按理由收窄断言，并正面
+锁定阶段 2 的替代物：断言它**持有**分析结果与迭代框架。若有人把分析结果从
+阶段 2 抽走，用例同样会红——即缺席不会退化成「没人测」。
+
+变异测试（逐一破坏 prompts.py 的注入点，确认断言不是空转）：
+
+  [CAUGHT] 阶段1 去掉 ANAPHORA_HINT        -> 1 failed
+  [CAUGHT] 阶段3 去掉 ANAPHORA_HINT        -> 1 failed
+  [CAUGHT] 阶段2 去掉分析结果              -> 1 failed
+  [CAUGHT] 阶段2 去掉迭代框架              -> 1 failed
+  [CAUGHT] 阶段2 去掉需求历史              -> 1 failed
+  还原后基线                               -> 1 passed
+
+============================================================
+4. T011 上下文体积有上限
+============================================================
+
+用例（纯函数 + 产物级各半——只测纯函数会漏掉「函数写对了但没被调用」）：
+  - test_previous_html_under_cap_is_injected_verbatim
+  - test_previous_html_over_cap_keeps_head_and_tail
+  - test_previous_html_handles_absent_values
+  - test_continue_history_under_cap_passes_through
+  - test_continue_history_over_cap_keeps_only_the_tail
+  - test_continue_history_cap_covers_the_continuation_tail
+  - test_oversized_previous_html_is_bounded_in_injected_prompt
+
+覆盖了原先在 tests/ 下零引用的四个符号：PREVIOUS_HTML_MAX_CHARS、
+truncate_previous_html、CONTINUE_HISTORY_MAX_CHARS、truncate_continue_history。
+最后一条是产物级：喂一个 20 万字符的上一版 HTML，断言真正注入给模型的消息
+体积仍受约束（含「已省略」标记且远小于原始长度）。
+
+============================================================
+5. T012 / T013 核准结果：无需改动实现
+============================================================
+
+tasks.md 把这两个任务的落点写成 services/pipeline.py，实际选取发生在
+routers/atoms.py:696–722（generate 组装参数处）。核准结论：
+
+  T012（FR-002）——previous_html 的选取条件为
+    Versions.status == "succeeded"  +  order_by(Versions.seq.desc())  +  limit(1)
+    即「seq 最大的成功版本」。失败/取消版本不在候选内。符合。
+  T013（FR-003/FR-005）——history_prompts 的选取条件为
+    Versions.status == "succeeded"  +  order_by(Versions.seq)  （升序），
+    并在下游由 prompts.build_history_block 按 HISTORY_MAX_ITEMS × HISTORY_ITEM_CHARS
+    封顶。符合。
+
+两处行为均已被 T009/T010/T011 的用例覆盖，故 T012/T013 不产生代码改动。
+
+============================================================
+6. T014 产物级核对（e2e_two_round.py）
+============================================================
+
+改造前的缺口（已实测确认，不是推测）：A5 的三条结论
+（长度比、旧功能保留 kept、新增「历史」added_history）**只 log 不判定**，
+退出码只看 results.get("round2") != "failed"。用旧实现跑同一场景：
+
+  旧实现退出码（第二轮成功，但 + 和 AC 都从产物里消失了）: 0
+
+也就是说：第二轮把第一轮功能全部丢掉，探针照样 exit 0 —— 恰恰是 A5 该拦的
+场景它拦不住。此外旧的功能探针用裸子串（"-" in html、"." in html），而任何
+HTML 都含 `-`（<!DOCTYPE html>）、`.`、`/`（闭合标签），判定恒为真，等于空转。
+
+本次改造：
+  * 新增 buttons(html)：从 <button> 可见文本提取控件集合；
+  * 新增 ARITH_BUTTONS：计算器算子控件集合（+ - × * ÷ / = . AC C ± %）；
+  * 新增 check(failures, label, ok, detail)：日志可见 + 失败影响退出码；
+  * _dump(results, failures)：任一条失败即非零退出。
+
+现在逐项判定（全部为产物级，均不看「注入了什么」）：
+  ① A5 长度比 seq2/seq1 >= 0.80
+  ② A5 第一轮确实产出了可识别的算子按钮（>= 4 个，防「两边都空所以都没丢」）
+  ③ A5 旧功能保留：第一轮的算子按钮集合 ⊆ 第二轮按钮集合，列出丢失项
+  ④ A5 新增能力「历史」出现在第二轮产物
+  ⑤ A7 每版 html_sha256 与 html 自洽
+  ⑥ A7 每版以 </html> 结尾
+  ⑦ A7 每版恰好一个 <body> 与一个 <!DOCTYPE>（防拼接双文档/缺骨架）
+  ⑧ A7 第二轮后回取 v1 摘要未变
+  ⑨ A7 第二轮后回取 v1 html **逐字节**不变
+  ⑩ 隔离：新身份的项目列表不含本探针项目
+  ⑪ 隔离：新身份直接取本项目详情返回 404
+  ⑫ 新会话（仅 header）能取回两轮版本，且 v2 摘要一致
+
+离线校验（不调用线上，不消耗配额）：
+  * buttons() 区分得开——删掉 <button>-</button> 与 <button>/</button> 后
+    lost set = ['-', '/']（非空），而正文里的 `-` `.` `/` 不会被误抓；
+  * 退出码判定——无失败 exit 0；有失败 exit 1；轮次 1 超时 exit 1
+    （旧实现在轮次 1 TIMEOUT 时同样 exit 0，一并修正）；
+    「第二轮成功但丢功能」exit 1。
+
+线上执行（T037）另计，本次未运行——线上会创建真实数据并消耗模型配额。
+
+============================================================
+7. 未决事项（不属 US1，转交后续任务）
+============================================================
+  * owner/身份相关 4 条红测 -> US2（T015–T018）
+  * 线上真实执行本探针 -> T037（需用户确认，会产生真实数据与配额消耗）

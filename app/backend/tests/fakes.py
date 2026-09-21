@@ -4,7 +4,9 @@ FakeAIHub 契约：
 - script 元素可为 str（作为 content 返回）、Exception（抛出）、
   Callable[[GenTxtRequest], str | Exception]（按请求分支）；
 - **记录每一次 GenTxtRequest** —— 断言注入内容（需求历史、上一版 HTML、
-  上下文预算）的唯一可靠来源。
+  上下文预算）的唯一可靠来源；调用计数一律用 ``len(fake.requests)``；
+- 脚本耗尽时**抛断言**而非返回空内容：耗尽说明脚本与实际调用次数不符，
+  必须响亮失败；要模拟「模型返回空」请在脚本里放 ``""``。
 
 异常类按 *类名* 与 pipeline.classify_upstream_error 匹配（不依赖 openai
 包的具体版本），status_code 属性用于状态码分支。
