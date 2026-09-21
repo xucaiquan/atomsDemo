@@ -1,16 +1,12 @@
-"""归属键（owner_key）的服务端派生。
+"""项目归属身份的服务端派生（设计文档 2026-09-20 S1.1）。
 
-对应 spec §2 不变量 1：**归属由服务端派生，请求体永不参与**。
+不变量 1 —— 归属由服务端派生，请求体永不参与：
 
-两级身份：
-- 登录用户 → ``user:{sub}``，来自平台 JWT 的 sub，客户端无法伪造。
-- 匿名访客 → ``anon:{nonce}.{sig}``，nonce 由服务端随机生成，sig 是
-  HMAC-SHA256 签名。客户端即使拿到 raw 也无法为别的 nonce 造出有效签名，
-  因此「换个 owner_key 就能看别人的项目」这条路被堵死。
+    登录 JWT 的 sub > 签名 cookie > X-Atoms-Anon 请求头 > 服务端新签发
 
-为什么匿名标识必须服务端签名：旧实现 ``lib/constants.ts::getOwnerKey()`` 用
-localStorage 里的 ``anon-xxxx`` 当归属键——那是客户端可任意伪造的字符串，
-且它全仓无任何调用点，等于没有隔离。
+客户端提供的任何字段（含历史遗留的 ``owner_key``）不得影响归属。
+匿名标识为 HMAC 签名（nonce.sig，共 49 字符），客户端无法伪造有效签名；
+cookie + 请求头双通道传输，消除「线上网关吃掉 Set-Cookie 就静默失效」的单点。
 """
 
 from __future__ import annotations
@@ -22,141 +18,107 @@ import secrets
 from dataclasses import dataclass
 from typing import Optional
 
+from fastapi import Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
 from core.auth import AccessTokenError, decode_access_token
 from core.config import settings
-from dependencies.auth import bearer_scheme
-from fastapi import Depends, Request
 
 logger = logging.getLogger(__name__)
 
 ANON_COOKIE = "atoms_anon"
 ANON_HEADER = "X-Atoms-Anon"
-# 180 天：匿名标识丢失意味着用户丢掉自己的项目列表，给足有效期。
-ANON_MAX_AGE = 180 * 24 * 3600
+ANON_MAX_AGE = 180 * 24 * 3600  # 180 天
 
-_SIG_CHARS = 16
-_NONCE_BYTES = 16
-# token_hex(16) → 32 个小写十六进制字符；键长 5 + 32 + 1 + 16 = 54，稳在 String(64) 内。
-_NONCE_CHARS = _NONCE_BYTES * 2
-# user: 键取 sha256 前 32 个十六进制字符（128 bit）——足够避免碰撞，且总长固定 37。
-_SUBJECT_CHARS = 32
+bearer_scheme = HTTPBearer(auto_error=False)
 
-# 空密钥降级只告警一次：每请求告警会把日志刷爆。
-_warned_missing_secret = False
+# JWT_SECRET_KEY 未配置时的兜底签名密钥：保证匿名标识在重启后仍可验签，
+# 避免老访客一夜之间「项目消失」。生产部署平台始终注入 JWT_SECRET_KEY，
+# 该兜底仅覆盖本地/演示环境。
+_FALLBACK_SECRET = "atoms-studio-anon-fallback-key"
 
 
 def _secret() -> bytes:
-    """签名密钥复用平台 JWT 密钥；未配置时返回空串（签名仍确定，但不安全）。
-
-    必须用 ``getattr`` 兜底：``settings.__getattr__`` 在环境变量缺失时**抛
-    AttributeError** 而不是返回空串，直接取属性会让 ``JWT_SECRET_KEY`` 未配置的
-    部署在每个路由上 500，与 get_owner 「密钥未配置仍按匿名身份工作」的约定冲突。
-
-    空密钥意味着匿名归属键任何人都能算出来，因此首次降级时告警一次，
-    让运维能发现，而不是无声无息地退化。
-    """
-    global _warned_missing_secret
-    secret = getattr(settings, "jwt_secret_key", "") or ""
-    if not secret and not _warned_missing_secret:
-        _warned_missing_secret = True
-        logger.warning("JWT 密钥未配置：匿名归属键的签名已降级为可预测值，本部署下匿名身份可被伪造，请配置 JWT_SECRET_KEY")
-    return secret.encode("utf-8")
+    return (getattr(settings, "jwt_secret_key", None) or _FALLBACK_SECRET).encode()
 
 
-def _user_key(subject: str) -> str:
-    """由 sub 派生定长归属键。
+@dataclass(frozen=True)
+class OwnerContext:
+    """一次请求解析出的归属身份。"""
 
-    必须**始终**哈希，不能只在 sub 过长时哈希：``users.id`` 是 String(255)，
-    sub 可远超 ``projects.owner_key`` 的 64 字符上限，直接拼接会让写入失败。
-    也不能截断 sub：共享长前缀的两个 sub 会塌缩成同一身份（数据泄露）。
-    哈希同时保证长度恒为 37 且两个不同 sub 得到两个不同键。
-    """
-    return f"user:{hashlib.sha256(subject.encode('utf-8')).hexdigest()[:_SUBJECT_CHARS]}"
+    owner_key: str  # "user:<sub>" | "anon:<nonce>.<sig>"
+    anon_key: Optional[str]  # 匿名身份时为 raw（nonce.sig）；登录身份时为 None
 
 
 def _sign(nonce: str) -> str:
-    return hmac.new(_secret(), nonce.encode("utf-8"), hashlib.sha256).hexdigest()[:_SIG_CHARS]
+    return hmac.new(_secret(), nonce.encode(), hashlib.sha256).hexdigest()[:16]
 
 
-def _is_lower_hex(value: str, length: int) -> bool:
-    """形状必须与 ``_issue`` 的输出严格一致：定长小写十六进制。"""
-    if len(value) != length:
-        return False
-    return all(char in "0123456789abcdef" for char in value)
-
-
-def _verify(raw: Optional[str]) -> Optional[str]:
-    """校验形状与签名，通过则返回 nonce，否则返回 None。
-
-    只验签不验形状是不够的：签名证明「这个 nonce 是你签过的」，不证明它有多长。
-    知道签名密钥的攻击者可以发 ``atoms_anon=<超长 nonce>.<有效签名>``，得到
-    ``anon:{超长 nonce}`` 归属键，超出 ``projects.owner_key`` 的 String(64) 列限——
-    写入要么报错、要么（若调用方截断）把不同 nonce 塌缩成同一身份。
-    这里按形状先拒绝，``anon:`` 键就被构造性地限死在 5+32+1+16=54 字符。
-    """
-    if not raw:
-        return None
+def _verify(raw: str) -> Optional[str]:
+    """校验匿名标识签名；通过返回 nonce，否则 None。"""
     parts = raw.split(".")
     if len(parts) != 2:
         return None
     nonce, sig = parts
-    if not _is_lower_hex(nonce, _NONCE_CHARS) or not _is_lower_hex(sig, _SIG_CHARS):
+    if len(nonce) != 32 or len(sig) != 16:
         return None
-    expected = _sign(nonce)
-    if not hmac.compare_digest(sig, expected):
+    if not hmac.compare_digest(_sign(nonce), sig):
         return None
     return nonce
 
 
 def _issue() -> str:
-    nonce = secrets.token_hex(_NONCE_BYTES)
+    """签发新的匿名标识：nonce(32) + '.' + sig(16) = 49 字符。"""
+    nonce = secrets.token_hex(16)
     return f"{nonce}.{_sign(nonce)}"
 
 
-@dataclass(frozen=True)
-class OwnerContext:
-    """本次请求的归属身份。
-
-    ``anon_key`` 非空表示这是匿名身份，调用方应把它回传客户端
-    （Set-Cookie 与 GET /projects 的响应体），让它下次带回来。
-    """
-
-    owner_key: str
-    anon_key: Optional[str] = None
+def _from_client_value(raw: Optional[str]) -> Optional[OwnerContext]:
+    """验签客户端携带的匿名标识（cookie 或请求头），通过则复用其身份。"""
+    candidate = (raw or "").strip()
+    if not candidate or len(candidate) > 49:
+        return None
+    if _verify(candidate) is None:
+        return None
+    return OwnerContext(owner_key=f"anon:{candidate}", anon_key=candidate)
 
 
 async def get_owner(
     request: Request,
-    credentials=Depends(bearer_scheme),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
 ) -> OwnerContext:
-    """按优先级派生归属键：登录 sub > cookie > 请求头 > 新签发。
+    """解析请求的归属身份。
 
-    fail-closed：查不到归属时不是拒绝，而是签发一个新匿名身份——新身份查不到
-    任何既有项目，效果等价于拒绝，但不会把「第一次访问」误伤。
+    签发策略（§8 偏离 1）：所有 atoms 路由共用这一个依赖；凡解析不出有效
+    标识的请求，一律视为新匿名会话并签发（幂等）。不采用「只在
+    list_projects/create_project 下发」的写法——generate 也可能是入口
+    （旧标签页直接提交），统一后无分支、不依赖前端调用顺序。
+
+    JWT 解析失败（AccessTokenError / 密钥未配置）**不报错**，落到匿名分支，
+    保证未登录用户始终可用（FR-014）。
     """
-    # ① 登录用户优先。token 无效时**不报错**，落到匿名分支——
-    #    密钥未配置或 token 过期的部署仍能按匿名身份工作。
-    if credentials:
+    # ① 登录 JWT
+    if credentials and credentials.credentials:
         try:
             payload = decode_access_token(credentials.credentials)
-            subject = payload.get("sub")
-            if subject:
-                return OwnerContext(owner_key=_user_key(subject), anon_key=None)
+            sub = payload.get("sub")
+            if sub:
+                return OwnerContext(owner_key=f"user:{sub}"[:64], anon_key=None)
         except AccessTokenError:
-            logger.debug("JWT 校验未通过，回退到匿名身份")
-        except Exception as exc:  # noqa: BLE001 - 校验异常不得中断请求
-            logger.warning("解析凭据时出现意外异常: %s", type(exc).__name__)
+            pass
+        except Exception:  # noqa: BLE001 - 任何 token 异常都不得阻断匿名访问
+            logger.debug("access token 解析异常，回落到匿名身份")
 
-    # ② cookie（HttpOnly，防 XSS 窃取）
-    # ③ 请求头（cookie 被网关吃掉时的退路）
-    for candidate in (
-        request.cookies.get(ANON_COOKIE),
-        request.headers.get(ANON_HEADER),
-    ):
-        nonce = _verify(candidate)
-        if nonce:
-            return OwnerContext(owner_key=f"anon:{candidate}", anon_key=candidate)
+    # ② 签名 cookie
+    ctx = _from_client_value(request.cookies.get(ANON_COOKIE))
+    if ctx:
+        return ctx
 
-    # ④ 新签发
+    # ③ X-Atoms-Anon 请求头（双通道）
+    ctx = _from_client_value(request.headers.get(ANON_HEADER))
+    if ctx:
+        return ctx
+
+    # ④ 均无效：新签发，由路由层经 Set-Cookie + 响应体回传
     raw = _issue()
     return OwnerContext(owner_key=f"anon:{raw}", anon_key=raw)

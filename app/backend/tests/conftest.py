@@ -1,93 +1,127 @@
-"""测试地基：SQLite 内存库 + ASGI 客户端 + get_db 覆盖。
+"""测试地基（设计文档 2026-09-20 S4）。
 
-为什么用 StaticPool：SQLite 的 ":memory:" 每个连接是一个**独立的库**。
-默认连接池会为并发请求开新连接，那些连接看不到已建的表。
-StaticPool 让所有会话复用同一个连接，内存库才跨会话可见。
+- SQLite 内存库 + StaticPool（内存库每连接独立，必须固定单连接）
+- httpx.AsyncClient(ASGITransport(app))：不经网络直打 FastAPI
+- override get_db + 替换 db_manager 会话工厂：后台生成任务与心跳走
+  db_manager.session()（不经过 get_db），只 override 依赖不够
+- GENERATION_INLINE=1：受理接口在当前协程内直接跑完流水线，
+  测试无需轮询后台任务，避免 flaky（仅测试用开关）
 
-为什么覆盖 get_db 而不是设置 DATABASE_URL：main.py 的 lifespan 会连真实库，
-而 ASGITransport 不跑 lifespan；覆盖依赖是唯一能保证测试绝不碰真实库的方式。
-
-退路（若 SQLite 建表失败）：改用
-    create_async_engine("sqlite+aiosqlite:///file:testdb?mode=memory&cache=shared&uri=true")
-或一个 tmp_path 下的临时文件库。
+运行方式保持不变：``cd app/backend && python -m pytest tests/ -q``
 """
 
 from __future__ import annotations
 
 import os
 
-# 必须在任何 core.config 导入**之前**生效：settings.__getattr__ 是「读环境变量」，
-# 且首次读取后会把值缓存进实例 __dict__。这里没有 .env 文件，三个 JWT 变量默认都未设，
-# 而 core.auth.create_access_token 依次读取它们（secret → expire_minutes → algorithm），
-# 缺任何一个都会抛 AttributeError，任何构造登录身份的测试都会失败。
-os.environ.setdefault("JWT_SECRET_KEY", "test-secret-key-for-pytest")
-os.environ.setdefault("JWT_EXPIRE_MINUTES", "60")
+# 必须在导入任何应用模块之前设置：
+os.environ.setdefault("MGX_IGNORE_MODULE_INIT", "true")
+os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret")
 os.environ.setdefault("JWT_ALGORITHM", "HS256")
+os.environ.setdefault("JWT_EXPIRE_MINUTES", "60")
+os.environ.setdefault("GENERATION_INLINE", "1")
 
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+from sqlalchemy.ext.asyncio import (  # noqa: E402
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import StaticPool  # noqa: E402
 
-# 必须显式导入每个模型模块，Base.metadata 才会被填充。
-from models import generation_steps, messages, projects, versions  # noqa: F401
-from core.database import Base, get_db
-from main import app
+import models.generation_steps  # noqa: E402,F401 - 注册 ORM 表
+import models.messages  # noqa: E402,F401
+import models.projects  # noqa: E402,F401
+import models.versions  # noqa: E402,F401
+from core.database import Base, db_manager, get_db  # noqa: E402
 
 
 @pytest_asyncio.fixture
-async def session_maker():
-    """函数级内存库：每个测试一个干净的空库。"""
-    engine = create_async_engine(
+async def engine():
+    """每个测试一套独立的内存库，测试间零串扰。"""
+    eng = create_async_engine(
         "sqlite+aiosqlite://",
-        connect_args={"check_same_thread": False},
         poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
     )
-    async with engine.begin() as conn:
+    async with eng.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    yield eng
+    await eng.dispose()
 
+
+@pytest_asyncio.fixture(autouse=True)
+async def shared_session_maker(engine):
+    """把 db_manager 的会话工厂指向测试库。
+
+    后台生成（_run_generation_in_background）与心跳（_heartbeat）都用
+    db_manager.session() 开独立会话；不替换的话它们会去连真实 PostgreSQL。
+    """
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    db_manager.engine = engine
+    db_manager.async_session_maker = maker
     yield maker
-    await engine.dispose()
+    db_manager.engine = None
+    db_manager.async_session_maker = None
 
 
 @pytest_asyncio.fixture
-async def db_session(session_maker):
-    """直接读写内存库的会话，用于摆布夹具数据（如演示项目）或直接断言持久化结果。
-
-    与 ``client`` 共用同一个 ``session_maker``（pytest 按测试缓存夹具实例），
-    因此这里 commit 的行，路由的请求会话立刻看得到。
-    """
-    async with session_maker() as session:
+async def db_session(shared_session_maker):
+    async with shared_session_maker() as session:
         yield session
 
 
-@pytest_asyncio.fixture
-async def atoms_app(session_maker):
-    """把 ``get_db`` 指向内存库，但**不**提供客户端。
+@pytest.fixture
+def app(shared_session_maker):
+    from main import app as fastapi_app
 
-    单独拆出来是给「一个测试要起多个互不相干的会话」的用例用的：httpx 的
-    AsyncClient 会自动持久化 cookie，而 get_owner 的优先级是 cookie > 请求头，
-    所以归属隔离的越权矩阵必须给每个身份一个全新的 cookie jar。依赖这个夹具的
-    测试自己 ``AsyncClient(transport=ASGITransport(app=app))`` 即可拿到同一套依赖覆盖。
-    """
-
-    async def _override_get_db():
-        async with session_maker() as session:
+    async def override_get_db():
+        async with shared_session_maker() as session:
             yield session
 
-    app.dependency_overrides[get_db] = _override_get_db
-    yield app
-    app.dependency_overrides.clear()
+    fastapi_app.dependency_overrides[get_db] = override_get_db
+    yield fastapi_app
+    fastapi_app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def http(app):
+    """创建独立会话的测试客户端工厂：每个实例 cookiejar 独立，模拟不同访客。"""
+
+    def _make(**kwargs):
+        return AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+            **kwargs,
+        )
+
+    return _make
 
 
 @pytest_asyncio.fixture
-async def client(atoms_app):
-    """ASGI 测试客户端，get_db 指向内存库。
+async def client(http):
+    async with http() as ac:
+        yield ac
 
-    ASGITransport 不会执行 lifespan，所以不会触发真实数据库连接。
-    """
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as http_client:
-        yield http_client
+
+@pytest.fixture
+def inject_fake_ai():
+    """向后台流水线注入 FakeAIHub（S4 可测性改造），测试后自动清理。"""
+    import routers.atoms as atoms_module
+
+    def _inject(fake):
+        atoms_module._PIPELINE_AI_FACTORY = lambda: fake
+        return fake
+
+    yield _inject
+    atoms_module._PIPELINE_AI_FACTORY = None
+
+
+@pytest.fixture(autouse=True)
+def fast_backoff(monkeypatch):
+    """重试退避清零，加速失败路径测试（不改生产行为）。"""
+    import services.pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "RETRY_BACKOFF_SECONDS", (0.0, 0.0, 0.0))
