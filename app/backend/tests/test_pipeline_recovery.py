@@ -92,18 +92,18 @@ async def test_happy_path_succeeds(http, inject_fake_ai):
 
 
 async def test_rate_limit_retries_then_succeeds(http, inject_fake_ai):
-    """429 两次后第三次成功：版本终态 succeeded，共 5 次调用。"""
+    """429 一次后重试成功：版本终态 succeeded，共 4 次调用（T003 收紧为最多 2 次尝试）。"""
     client = http()
     async with client:
         pid = await _create_project(client)
         fake = inject_fake_ai(
             FakeAIHub(
-                [ANALYSIS_JSON, DESIGN_JSON, RateLimitError("429"), RateLimitError("429"), make_html("x")]
+                [ANALYSIS_JSON, DESIGN_JSON, RateLimitError("429"), make_html("x")]
             )
         )
         seq = (await _generate(client, pid, "做一个待办")).json()["version_seq"]
         assert (await _version_detail(client, pid, seq)).json()["status"] == "succeeded"
-        assert len(fake.requests) == 5
+        assert len(fake.requests) == 4
 
 
 async def test_rate_limit_exhausted_marks_failed(http, inject_fake_ai):
@@ -112,7 +112,7 @@ async def test_rate_limit_exhausted_marks_failed(http, inject_fake_ai):
         pid = await _create_project(client)
         fake = inject_fake_ai(
             FakeAIHub(
-                [ANALYSIS_JSON, DESIGN_JSON] + [RateLimitError("429")] * 3
+                [ANALYSIS_JSON, DESIGN_JSON] + [RateLimitError("429")] * 2
             )
         )
         seq = (await _generate(client, pid, "做一个待办")).json()["version_seq"]
@@ -120,9 +120,9 @@ async def test_rate_limit_exhausted_marks_failed(http, inject_fake_ai):
         assert detail["status"] == "failed"
         assert detail["error_type"] == "rate_limit"  # S3.5 可观测
         assert detail["summary"]["upstream_status"] == 429
-        assert detail["summary"]["attempts"] == 3
+        assert detail["summary"]["attempts"] == 2
         assert "限流" in detail["error"]  # 面向用户的可读中文
-        assert len(fake.requests) == 5  # 1 + 3 次尝试
+        assert len(fake.requests) == 4  # 1 + 2 次尝试
         steps = (
             await client.get(f"/api/v1/atoms/projects/{pid}/versions/{seq}/steps")
         ).json()["steps"]
@@ -175,18 +175,18 @@ async def test_stage_timeout_classified_as_timeout(http, inject_fake_ai, monkeyp
 
 
 async def test_empty_content_retries_with_lower_max_tokens(http, inject_fake_ai):
-    """连续两次空内容后成功；第二次空后 max_tokens 降级（16384→8192）。"""
+    """首次空内容后降级 max_tokens（16384→8192）重试并成功（最多 2 次尝试）。"""
     client = http()
     async with client:
         pid = await _create_project(client)
         fake = inject_fake_ai(
-            FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, "   ", "", make_html("ok")])
+            FakeAIHub([ANALYSIS_JSON, DESIGN_JSON, "   ", make_html("ok")])
         )
         seq = (await _generate(client, pid, "做一个待办")).json()["version_seq"]
         assert (await _version_detail(client, pid, seq)).json()["status"] == "succeeded"
-        assert len(fake.requests) == 5
+        assert len(fake.requests) == 4
         assert fake.requests[2].max_tokens == 16384  # 第一次代码调用
-        assert fake.requests[4].max_tokens == 8192  # 降级后
+        assert fake.requests[3].max_tokens == 8192  # 降级后
 
 
 async def test_all_empty_content_fails_as_empty(http, inject_fake_ai):

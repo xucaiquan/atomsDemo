@@ -12,9 +12,12 @@
   便于排障（S3.5）。
 - 上游故障按 kind 分类处理：auth 不重试；rate_limit/timeout/upstream_5xx/unknown
   退避重试；空内容降级 max_tokens 再试；截断走续写/重跑链（S3.1）。
-- 每次模型调用用 ``asyncio.wait_for`` 施加 240s 显式超时（S3.2），生成期间由
-  **独立 DB 会话**的心跳任务每 30s 刷新 ``versions.updated_at``，配合
-  routers 侧按 updated_at 的 stale 判定，长任务不再被误杀。
+- 每次模型调用用 ``asyncio.wait_for`` 施加 ``min(STAGE_TIMEOUT, remaining)``
+  显式超时（T004），整体受 ``GENERATION_BUDGET_SECONDS`` 单调预算约束，
+  预算耗尽时立即以 ``budget_exhausted`` 止损（T005）。
+- 心跳已删除（T006）：``versions.updated_at`` 只在真实进展点推进
+  （``_finish_step`` 写摘要、``_fail`` 写终态、成功收尾写终态），
+  活任务最长静默期 = 整体预算 420s < ``STALE_AFTER`` 600s，长任务不被误杀。
 """
 
 from __future__ import annotations
@@ -26,10 +29,11 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from time import monotonic
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.database import db_manager
 from models.generation_steps import Generation_steps
 from models.messages import Messages
 from models.projects import Projects
@@ -59,15 +63,21 @@ CONTINUE_TAIL_CHARS = 2000
 # 续写产出若以完整文档开头，视为模型重开了整篇文档，直接采用新产出。
 _DOC_RESTART_PATTERN = re.compile(r"<!DOCTYPE\s+html|<html[\s>]", re.IGNORECASE)
 
-# S3.2 显式超时与心跳。三者关系（test_stale_recovery.py 断言同一常量）：
-# HEARTBEAT_INTERVAL(30s) < STALE_AFTER(10min) < 前端轮询上限(12min)
-STAGE_TIMEOUT = 240.0
-HEARTBEAT_INTERVAL = 30.0
+# 时间预算（002-harden-increment-session T003）：
+# - STAGE_TIMEOUT=120s：单次模型调用超时，取在上游实测 126.2s 返回 524 的
+#   切断点之内，避免触碰网关代理超时；
+# - GENERATION_BUDGET_SECONDS=420s：单次生成整体上限（入口单调截止）；
+# - 不等关系 120 < 420 < 600(STALE_AFTER) < 720(前端轮询上限 12min)
+#   由 tests/test_stale_recovery.py::test_timing_constants_ordering 守护。
+STAGE_TIMEOUT = 120.0
+GENERATION_BUDGET_SECONDS = 420.0
+# 预算耗尽止损（T005）：remaining 低于该值时不再发起新的模型调用。
+MIN_CALL_BUDGET_SECONDS = 5.0
 
-# S3.1 退避重试：rate_limit / timeout / upstream_5xx / unknown 最多 3 次尝试，
-# 间隔 0.5 → 1 → 2 秒。auth 不重试。
-RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
-MAX_ATTEMPTS = 3
+# S3.1 退避重试：rate_limit / timeout / upstream_5xx / unknown 最多 2 次尝试，
+# 间隔 0.5 → 1 秒。auth 不重试。收紧次数使最坏路径落在整体预算内。
+RETRY_BACKOFF_SECONDS = (0.5, 1.0)
+MAX_ATTEMPTS = 2
 
 ACTIVE_STATUSES = ("pending", "running")
 FALLBACK_TITLE = "未命名项目"
@@ -81,6 +91,8 @@ UPSTREAM_USER_MESSAGES = {
     "empty": "模型返回了空内容，请重新提交生成",
     "truncated": "生成的页面内容不完整（可能被截断），请简化需求后重试",
     "unknown": "模型服务暂时不可用，请稍后重试",
+    # T005：整体预算耗尽止损文案
+    "budget_exhausted": "生成耗时超过整体时间预算，已提前终止，请稍后重试",
 }
 
 
@@ -229,7 +241,7 @@ class GenerationPipeline:
 
     1. :meth:`prepare` —— 短 DB 阶段：校验并发、落库版本与 3 条步骤，然后 commit。
     2. :meth:`run` —— 执行三阶段 AI 调用，其间每个阶段用独立短 DB 阶段更新状态；
-       生成期间由独立会话的心跳任务刷新 ``versions.updated_at``。
+       整体受 ``GENERATION_BUDGET_SECONDS`` 单调预算约束（心跳已删除，T006）。
 
     ``ai`` 参数供测试注入 FakeAIHub（S4）；生产默认 ``AIHubService()``。
     """
@@ -238,6 +250,11 @@ class GenerationPipeline:
         self._db = db
         self._ai_override = ai
         self._ai_service: Any | None = None
+        # T004：流水线整体的单调截止时刻，run() 入口设置；
+        # 直接构造而未 run 时为 None，视为无预算约束（便于单元测试）。
+        self._deadline: float | None = None
+        # T031：流水线实际所在阶段，由 _call_step 进入时记录，供通用兜底归因。
+        self._current_step = 0
 
     @property
     def _ai(self) -> Any:
@@ -336,25 +353,22 @@ class GenerationPipeline:
             }
         await self._set_version_status(project_public_id, version_seq, "running")
 
-        # 心跳：AI 调用可能持续数分钟，独立会话每 30s 刷 updated_at，
-        # 防止 stale recovery 把进行中的长任务误判为中断（S3.2）。
-        heartbeat = asyncio.create_task(self._heartbeat(project_public_id, version_seq))
-        try:
-            outcome = await self._run_stages(
-                started,
-                project_public_id,
-                version_seq,
-                prompt,
-                previous_html,
-                history_prompts,
-            )
-        finally:
-            heartbeat.cancel()
-            try:
-                await heartbeat
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        return outcome
+        # T004：入口计算单调截止时刻，整条流水线受 GENERATION_BUDGET_SECONDS 约束。
+        self._deadline = monotonic() + GENERATION_BUDGET_SECONDS
+        return await self._run_stages(
+            started,
+            project_public_id,
+            version_seq,
+            prompt,
+            previous_html,
+            history_prompts,
+        )
+
+    def _remaining(self) -> float:
+        """T004：距整体预算截止的剩余秒数；无截止（单测直构）时视为无限。"""
+        if self._deadline is None:
+            return float("inf")
+        return self._deadline - monotonic()
 
     async def _run_stages(
         self,
@@ -440,12 +454,24 @@ class GenerationPipeline:
             }
         except Exception as exc:  # noqa: BLE001 - 兜底为可读中文提示
             logger.exception("生成流水线异常: %s", exc)
+            # T031：归因到流水线实际所在阶段（_call_step 进入时记录），不硬编码 3；
+            # summary 记录异常类名保留可观测性。不把该异常移进 _call_step 的重试
+            # try——数据库/代码故障不是可重试的上游错误（research.md R-4）。
+            failed_seq = self._current_step or 3
             message = "模型服务暂时不可用，请稍后重试"
-            await self._fail(project_public_id, version_seq, 3, message, error_type="unknown")
+            await self._fail(
+                project_public_id,
+                version_seq,
+                failed_seq,
+                message,
+                error_type="unknown",
+                attempts=1,
+                exception_class=type(exc).__name__,
+            )
             return {
                 "status": "failed",
                 "message": message,
-                "failed_seq": 3,
+                "failed_seq": failed_seq,
                 "error_type": "unknown",
                 "steps": await self.load_steps(project_public_id, version_seq),
             }
@@ -505,34 +531,6 @@ class GenerationPipeline:
             "summary": summary,
             "steps": await self.load_steps(project_public_id, version_seq),
         }
-
-    # ------------------------------------------------------------------ 心跳
-
-    async def _heartbeat(self, public_id: str, version_seq: int) -> None:
-        """每 30s 用**独立 DB 会话**刷新 versions.updated_at（S3.2）。
-
-        必须独立会话：SQLAlchemy AsyncSession 禁止被两个协程并发使用，
-        而心跳在 AI 调用（self._db 空闲于 await gentxt）期间持续运行。
-        仅在版本仍处于 ACTIVE_STATUSES 时刷新——取消后迟到的心跳不得写活。
-        """
-        while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            try:
-                async with db_manager.session() as session:
-                    result = await session.execute(
-                        select(Versions).where(
-                            Versions.project_public_id == public_id,
-                            Versions.seq == version_seq,
-                        )
-                    )
-                    version = result.scalars().first()
-                    if version and version.status in ACTIVE_STATUSES:
-                        version.updated_at = datetime.now(timezone.utc)
-                        await session.commit()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - 心跳失败不影响生成主流程
-                logger.warning("心跳刷新失败 project=%s seq=%s: %s", public_id[:8], version_seq, exc)
 
     # ------------------------------------------------------------------ 阶段 3 恢复链
 
@@ -635,15 +633,19 @@ class GenerationPipeline:
     ) -> str:
         """把步骤置 running 后调用模型（非流式，便于完整校验产出）。
 
-        S3.1/S3.2 的恢复策略：
-        - 每次调用用 ``asyncio.wait_for`` 施加 STAGE_TIMEOUT 显式超时；
+        S3.1 与 002 特性的恢复策略：
+        - 每次调用用 ``asyncio.wait_for`` 施加 ``min(STAGE_TIMEOUT, remaining)``
+          显式超时（T004）；
         - auth 类错误不重试，立即失败 + ERROR 日志；
-        - rate_limit / timeout / upstream_5xx / unknown 退避重试（0.5→1→2s，最多 3 次）；
-        - 空内容先原样重试一次，再降 max_tokens 试一次。
+        - rate_limit / timeout / upstream_5xx / unknown 退避重试（0.5→1s，最多 2 次）；
+        - 空内容先原样重试一次，再降 max_tokens 试一次；
+        - 整体预算耗尽时不再发起新的模型调用，以 ``budget_exhausted`` 止损（T005）。
 
         阶段边界取消检查：用户在上一阶段执行期间点了「停止生成」时，
         版本已被取消接口置为 cancelled，这里不再发起新的模型调用。
         """
+        # T031：记录流水线实际所在阶段，供 run() 的通用兜底归因使用。
+        self._current_step = step_seq
         version = await self._get_version(project_public_id, version_seq)
         if version and version.status == "cancelled":
             raise GenerationCancelled(step_seq)
@@ -668,10 +670,21 @@ class GenerationPipeline:
         last_upstream: UpstreamError | None = None
         for attempt in range(MAX_ATTEMPTS):
             attempts_used = attempt + 1
+            # T005：预算耗尽止损——剩余时间不足以支撑一次有意义的调用时，
+            # 立即以 budget_exhausted 失败，不再进入重试循环。
+            if self._remaining() < MIN_CALL_BUDGET_SECONDS:
+                raise PipelineError(
+                    UPSTREAM_USER_MESSAGES["budget_exhausted"],
+                    step_seq,
+                    error_type="budget_exhausted",
+                    attempts=attempts_used - 1,
+                )
             call_started = _now()
             try:
                 response = await asyncio.wait_for(
-                    self._ai.gentxt(request), timeout=STAGE_TIMEOUT
+                    self._ai.gentxt(request),
+                    # T004：单次调用超时不超过整体预算剩余时间
+                    timeout=min(STAGE_TIMEOUT, self._remaining()),
                 )
             except Exception as exc:  # noqa: BLE001
                 upstream = (
@@ -793,12 +806,27 @@ class GenerationPipeline:
         error_type: str | None = None,
         upstream_status: int | None = None,
         attempts: int | None = None,
+        exception_class: str | None = None,
     ) -> None:
-        step = await self._get_step(project_public_id, version_seq, step_seq)
-        if step:
-            step.status = "failed"
-            step.output = message
-            step.ended_at = _iso(_now())
+        # T032：清扫残留——把该版本所有仍处于 running/pending 的步骤一并置为
+        # failed（数据库/代码故障不会给步骤留下自然终态），归因步骤写失败原因。
+        steps_result = await self._db.execute(
+            select(Generation_steps)
+            .where(
+                Generation_steps.project_public_id == project_public_id,
+                Generation_steps.version_seq == version_seq,
+            )
+            .execution_options(populate_existing=True)
+        )
+        for step in steps_result.scalars().all():
+            if step.seq == step_seq:
+                step.status = "failed"
+                step.output = message
+                step.ended_at = step.ended_at or _iso(_now())
+            elif step.status in ACTIVE_STATUSES:
+                step.status = "failed"
+                step.output = "已随失败收尾终止"
+                step.ended_at = step.ended_at or _iso(_now())
         version = await self._get_version(project_public_id, version_seq)
         # 取消守卫：版本已被取消接口置为 cancelled 时，迟到的失败不得覆盖取消态
         if version and version.status in ACTIVE_STATUSES:
@@ -812,7 +840,14 @@ class GenerationPipeline:
                 existing["upstream_status"] = upstream_status
             if attempts is not None:
                 existing["attempts"] = attempts
-            if error_type or upstream_status is not None or attempts is not None:
+            if exception_class:
+                existing["exception_class"] = exception_class
+            if (
+                error_type
+                or upstream_status is not None
+                or attempts is not None
+                or exception_class
+            ):
                 version.summary = json.dumps(existing, ensure_ascii=False)
         project = await self._get_project(project_public_id)
         if project and project.latest_status in ACTIVE_STATUSES:

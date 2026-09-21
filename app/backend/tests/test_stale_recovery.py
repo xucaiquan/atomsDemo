@@ -1,12 +1,13 @@
-"""心跳与 stale recovery 测试（设计文档 S3.2 / S1.2，验收 A3 补充）。
+"""stale recovery 测试（设计文档 S1.2 / S3.2；002-harden-increment-session T006/T007）。
 
+心跳已删除：``versions.updated_at`` 只在真实进展点推进（阶段完成写摘要、
+失败/成功收尾写终态），因此进行中任务的最长静默期 = 整体预算。
 时间常量关系必须成立（前端轮询上限 12min 在 lib/constants 侧）：
-HEARTBEAT_INTERVAL(30s) < STALE_AFTER(10min) < 轮询上限(12min)
+GENERATION_BUDGET_SECONDS(420s) < STALE_AFTER(10min) < 轮询上限(12min)
 """
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -17,7 +18,6 @@ from models.projects import Projects
 from models.versions import Versions
 from routers import atoms as atoms_module
 from services import pipeline as pipeline_module
-from services.pipeline import GenerationPipeline
 
 
 def _naive_utc_ago(seconds: float) -> datetime:
@@ -26,11 +26,21 @@ def _naive_utc_ago(seconds: float) -> datetime:
 
 
 def test_timing_constants_ordering():
-    assert pipeline_module.HEARTBEAT_INTERVAL == 30.0
-    assert pipeline_module.STAGE_TIMEOUT == 240.0
+    """预算内活任务不被 stale 误杀的常量关系守护（心跳删除后的新语义）。"""
+    assert pipeline_module.STAGE_TIMEOUT == 120.0
+    assert pipeline_module.GENERATION_BUDGET_SECONDS == 420.0
     assert atoms_module.STALE_AFTER == timedelta(minutes=10)
-    assert pipeline_module.HEARTBEAT_INTERVAL < atoms_module.STALE_AFTER.total_seconds()
+    # 心跳已删除：活任务最长静默期 = 整体预算，必须落在 stale 阈值之内
+    assert (
+        pipeline_module.GENERATION_BUDGET_SECONDS
+        < atoms_module.STALE_AFTER.total_seconds()
+    )
     assert atoms_module.STALE_AFTER.total_seconds() < 12 * 60
+    # 单阶段超时 × 重试次数也必须落在整体预算内（最坏路径不会超出 deadline）
+    assert (
+        pipeline_module.STAGE_TIMEOUT * pipeline_module.MAX_ATTEMPTS
+        < pipeline_module.GENERATION_BUDGET_SECONDS
+    )
 
 
 async def _seed_running_version(pid: str, seconds_ago: float) -> None:
@@ -71,7 +81,7 @@ async def _make_project(client) -> str:
 
 
 async def test_stale_running_version_recovered(http):
-    """超过 STALE_AFTER 无心跳的 running 版本：详情接口把它落为 failed。"""
+    """超过 STALE_AFTER 无进展的 running 版本：详情接口把它落为 failed。"""
     client = http()
     async with client:
         pid = await _make_project(client)
@@ -86,7 +96,7 @@ async def test_stale_running_version_recovered(http):
 
 
 async def test_fresh_running_version_not_killed(http):
-    """心跳正常（updated_at 新鲜）的进行中版本不被 stale 判定误杀。"""
+    """updated_at 新鲜（真实进展点刚推进过）的进行中版本不被 stale 判定误杀。"""
     client = http()
     async with client:
         pid = await _make_project(client)
@@ -120,72 +130,3 @@ async def test_stale_recovery_is_owner_scoped(http):
         # A 自己的请求才触发恢复
         detail = (await a.get(f"/api/v1/atoms/projects/{pid}")).json()
         assert detail["versions"][0]["status"] == "failed"
-
-
-async def test_heartbeat_refreshes_updated_at(db_session, shared_session_maker, monkeypatch):
-    """心跳用独立会话周期刷新 versions.updated_at；cancelled 版本不再写活。"""
-    monkeypatch.setattr(pipeline_module, "HEARTBEAT_INTERVAL", 0.05)
-
-    async with db_manager.session() as session:
-        session.add(
-            Projects(
-                public_id="hb-pid", title="t", owner_key="anon:x",
-                version_count=1, latest_status="running", is_demo=False,
-            )
-        )
-        session.add(
-            Versions(
-                project_public_id="hb-pid", seq=1, prompt="p",
-                status="running", updated_at=_naive_utc_ago(3600),
-            )
-        )
-        await session.commit()
-
-    pipeline = GenerationPipeline(db_session, ai=object())
-    task = asyncio.create_task(pipeline._heartbeat("hb-pid", 1))
-    await asyncio.sleep(0.3)  # 至少 4 个心跳周期
-
-    async with db_manager.session() as session:
-        version = (
-            await session.execute(
-                Versions.__table__.select().where(
-                    Versions.project_public_id == "hb-pid"
-                )
-            )
-        ).first()
-        age = datetime.now(timezone.utc).replace(tzinfo=None) - version.updated_at
-        assert age < timedelta(seconds=5)  # 已被刷新到当下
-
-    # 版本转 cancelled 后，迟到的心跳不得把它写回活跃时间线
-    async with db_manager.session() as session:
-        row = (
-            await session.execute(
-                Versions.__table__.select().where(
-                    Versions.project_public_id == "hb-pid"
-                )
-            )
-        ).first()
-        target = (
-            await session.get(Versions, row.id)
-        )
-        target.status = "cancelled"
-        target.updated_at = _naive_utc_ago(3600)
-        await session.commit()
-
-    await asyncio.sleep(0.2)
-    async with db_manager.session() as session:
-        after = (
-            await session.execute(
-                Versions.__table__.select().where(
-                    Versions.project_public_id == "hb-pid"
-                )
-            )
-        ).first()
-        age = datetime.now(timezone.utc).replace(tzinfo=None) - after.updated_at
-        assert age > timedelta(minutes=59)  # 心跳对已取消版本停写
-
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
