@@ -8,7 +8,7 @@
  * 用于核验「预览所见 == 源码所存」。
  */
 import { useMemo, useState } from 'react';
-import { Check, Copy } from 'lucide-react';
+import { AlertCircle, Check, Copy } from 'lucide-react';
 
 interface CodeViewerProps {
   html: string;
@@ -41,30 +41,69 @@ function highlight(line: string): string {
   );
 }
 
+type CopyState = 'idle' | 'copied' | 'failed';
+
+/**
+ * 复制文本到剪贴板，带降级路径。
+ *
+ * `navigator.clipboard` 只在安全上下文（https / localhost）下存在，且在被嵌入的
+ * iframe 中还可能因缺少 clipboard-write 权限而 reject。此前实现只调用它、失败时
+ * 静默吞掉异常，所以在这些环境里按钮点了完全没反应——这正是「复制代码按钮不生效」
+ * 的成因。这里先试异步 API，不可用或抛错时回退到 execCommand('copy')，
+ * 两条路都失败才返回 false，由调用方给出可见的失败提示。
+ */
+async function copyText(text: string): Promise<boolean> {
+  if (!text) return false;
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // 落到下面的 execCommand 降级路径
+    }
+  }
+
+  try {
+    const area = document.createElement('textarea');
+    area.value = text;
+    // 必须在文档里且可聚焦才能被 execCommand 选中；同时避免滚动跳动与可见闪烁。
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.top = '0';
+    area.style.left = '0';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.focus();
+    area.select();
+    area.setSelectionRange(0, text.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(area);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export default function CodeViewer({ html, seq, sha256 }: CodeViewerProps) {
-  const [copied, setCopied] = useState(false);
-  const [shaCopied, setShaCopied] = useState(false);
+  const [copyState, setCopyState] = useState<CopyState>('idle');
+  const [shaCopyState, setShaCopyState] = useState<CopyState>('idle');
   const lines = useMemo(() => (html ? html.split('\n') : []), [html]);
 
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(html);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
-    } catch {
-      setCopied(false);
-    }
+  const runCopy = async (
+    text: string,
+    setState: (next: CopyState) => void,
+  ) => {
+    const ok = await copyText(text);
+    setState(ok ? 'copied' : 'failed');
+    setTimeout(() => setState('idle'), ok ? 1600 : 2600);
   };
 
-  const handleCopySha = async () => {
-    if (!sha256) return;
-    try {
-      await navigator.clipboard.writeText(sha256);
-      setShaCopied(true);
-      setTimeout(() => setShaCopied(false), 1600);
-    } catch {
-      setShaCopied(false);
-    }
+  const handleCopy = () => runCopy(html, setCopyState);
+
+  const handleCopySha = () => {
+    if (!sha256) return Promise.resolve();
+    return runCopy(sha256, setShaCopyState);
   };
 
   if (!html) {
@@ -90,7 +129,12 @@ export default function CodeViewer({ html, seq, sha256 }: CodeViewerProps) {
               title="点击复制完整 SHA-256（与预览同一版本内容哈希）"
               className="truncate rounded border border-slate-700 bg-slate-950/60 px-1.5 py-0.5 font-mono text-[10px] text-slate-500 transition-colors hover:border-sky-500/50 hover:text-sky-300"
             >
-              SHA-256 {shaCopied ? '已复制 ✓' : sha256.slice(0, 16)}…
+              SHA-256{' '}
+              {shaCopyState === 'copied'
+                ? '已复制 ✓'
+                : shaCopyState === 'failed'
+                  ? '复制失败，请手动选中'
+                  : `${sha256.slice(0, 16)}…`}
             </button>
           )}
         </span>
@@ -99,8 +143,18 @@ export default function CodeViewer({ html, seq, sha256 }: CodeViewerProps) {
           onClick={() => void handleCopy()}
           className="flex items-center gap-1 rounded-md border border-slate-700 px-2 py-1 text-[11px] text-slate-300 transition-colors hover:border-sky-500/50 hover:text-sky-300"
         >
-          {copied ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
-          {copied ? '已复制' : '复制代码'}
+          {copyState === 'copied' ? (
+            <Check className="h-3 w-3 text-emerald-400" />
+          ) : copyState === 'failed' ? (
+            <AlertCircle className="h-3 w-3 text-amber-400" />
+          ) : (
+            <Copy className="h-3 w-3" />
+          )}
+          {copyState === 'copied'
+            ? '已复制'
+            : copyState === 'failed'
+              ? '复制失败'
+              : '复制代码'}
         </button>
       </div>
       <div className="flex-1 overflow-auto bg-slate-950/80 font-mono text-[12px] leading-5">
