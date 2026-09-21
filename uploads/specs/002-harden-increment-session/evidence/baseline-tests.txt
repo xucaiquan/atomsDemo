@@ -1,0 +1,15 @@
+FAILED tests/test_owner_dependency.py::test_distinct_long_subjects_yield_distinct_keys
+FAILED tests/test_owner_dependency.py::test_missing_secret_warns_once - asser...
+ERROR tests/test_conftest_smoke.py::test_sqlite_can_create_tables
+ERROR tests/test_conftest_smoke.py::test_json_roundtrip_with_timezone_column
+8 failed, 90 passed, 4 warnings, 2 errors in 4.15s
+FAILED tests/test_fake_aihub.py::test_exhausted_script_returns_empty_not_error
+FAILED tests/test_generation_inline.py::test_inline_generation_reaches_succeeded
+FAILED tests/test_generation_inline.py::test_explicitly_disabled_flag_does_not_enable_inline
+FAILED tests/test_generation_inline.py::test_env_unset_keeps_generation_out_of_the_request
+FAILED tests/test_owner_dependency.py::test_verify_rejects_client_made_key - ...
+FAILED tests/test_owner_dependency.py::test_verify_rejects_non_canonical_shape
+FAILED tests/test_owner_dependency.py::test_distinct_long_subjects_yield_distinct_keys
+FAILED tests/test_owner_dependency.py::test_missing_secret_warns_once - asser...
+ERROR tests/test_conftest_smoke.py::test_sqlite_can_create_tables
+ERROR tests/test_conftest_smoke.py::test_json_roundtrip_with_timezone_column

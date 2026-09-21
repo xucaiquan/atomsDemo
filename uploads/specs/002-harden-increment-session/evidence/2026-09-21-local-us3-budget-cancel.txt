@@ -1,0 +1,100 @@
+================================================================================
+002-harden-increment-session · US3（时间预算 / 失败归因 / 取消）验收证据
+日期：2026-09-21   被测版本：local（工作区未提交）   环境：本地，零配额
+任务：T026–T035 + T036 全量回归
+================================================================================
+
+【结论】US3 全部任务完成；两侧回归 0 failed / 0 errors。
+        backend: 157 passed   frontend: lint ✓  build ✓  tsc --noEmit ✓
+
+--------------------------------------------------------------------------------
+一、新增/扩展的测试（T026–T030、T034）
+--------------------------------------------------------------------------------
+T026 tests/test_pipeline_recovery.py::test_internal_error_is_attributed_to_actual_stage
+     参数化 fail_at_stage∈{1,2}，在 _call_step 的重试 try **之外**（GenTxtRequest
+     构造处）抛 RuntimeError，断言归因到真实阶段、summary 含异常类名、无 Traceback、
+     无残留 running、后续阶段保持 pending。修复前硬编码 step_seq=3。
+T027 tests/test_budget_exhaustion.py（新文件，3 条）
+     · 永不返回的上游 → 调用次数 == MAX_ATTEMPTS、耗时 ≤ 预算 + 容忍度、
+       error_type == "timeout"（上游不响应）、attempts 如实记录、html 空、描述保留、
+       紧接再次 generate 被受理且成功。
+     · 慢而成功的阶段把预算吃光 → 阶段边界止损，error_type == "budget_exhausted"、
+       文案含「超出时间预算」「描述已保留」、步骤为 [succeeded, failed, pending]、
+       attempts == 0、只调用过 1 次、无多余版本、随后重新提交被受理。
+     · 两种注入的 error_type 与文案**互不相等**——「可区分」的唯一可执行检验。
+T028 test_every_fault_class_leaves_a_complete_failure_record（5 类故障参数化）
+T029 test_steps_endpoint_recovers_stale_and_allows_retry（轮询端点自身回收 + error_type 非空）
+T030 tests/test_cancel_live_task.py（新文件，3 条，**唯一非 INLINE 模式**）
+     · task.cancel() 真的中断停在模型调用点的后台任务：三者为 cancelled、
+       闸门始终未打开、无新调用、任务已从 _RUNNING_TASKS 摘除。
+     · 迟到的**失败**不得覆盖取消态，也不得往会话追加「生成失败」。
+     · 迟到的**成功**不得覆盖取消态（阶段边界检查）——用「吞掉取消并照常返回」的
+       假上游模拟已在路上的响应；指纹是阶段 1 == succeeded（证明迟到响应真的到达）。
+T034 tests/test_time_budget_invariants.py::test_upstream_client_declares_its_own_wait_limit
+
+--------------------------------------------------------------------------------
+二、TDD 红→绿：修复前实测到的缺陷证据
+--------------------------------------------------------------------------------
+(1) T027 暴露 FR-013 缺字段：预算止损路径不写 attempts。红：
+      KeyError: 'attempts'   （tests/test_budget_exhaustion.py:217）
+    修复：pipeline.py 预算闸门 raise PipelineError(..., attempts=self._current_attempts)
+    ——如实记录 0 次「一次上游调用都没发生」，与「试过但失败了」区分开。
+(2) T030 暴露 FR-017 类缺陷：取消之后迟到的失败仍会往会话追加
+      「生成失败：…」，把「我停的」说成「它坏了」，并引导用户重试一个刚放弃的请求。
+    修复：_fail 的消息写入同样受取消守卫约束（只排除取消态，其它情况行为不变）。
+(3) T034 暴露 FR-012 未落实。红（实测 openai 2.16.0 默认值）：
+      AssertionError: 上游客户端等待上限为
+        Timeout(connect=5.0, read=600, write=600, pool=600)，未与 STAGE_TIMEOUT (120.0s) 对齐
+      assert Timeout(connect=5.0, read=600, write=600, pool=600) == 120.0
+    修复：aihub.py 显式 timeout=STAGE_TIMEOUT、max_retries=1（延迟导入避免与
+    pipeline 成环）。库默认 read=600s 会让自有 wait_for 放弃后连接仍悬挂 600s。
+
+--------------------------------------------------------------------------------
+三、受控变异：证明断言不是自证（每次变异后均已逐字回滚，grep MUTANT == 0）
+--------------------------------------------------------------------------------
+变异                                            捕获它的用例
+A timeout = max(STAGE_TIMEOUT, 剩余预算)         T027 永不返回上游（调用次数断言）
+  （去掉「单次等待 ≤ 剩余预算」）                 1 failed / 2 passed
+B 去掉阶段入口的预算闸门                          T027 预算止损 + T027 可区分性
+                                                 2 failed / 1 passed
+C BUDGET_EXHAUSTED_ERROR_TYPE = "timeout"        T027 永不返回上游 + T027 可区分性
+  （与上游超时混为一谈）                          2 failed / 1 passed
+D 去掉阶段边界的取消检查                          T030 迟到成功被丢弃
+                                                 1 failed / 2 passed
+E _fail 去掉 ACTIVE_STATUSES 取消守卫             T030 迟到失败不覆盖取消
+                                                 1 failed / 2 passed
+F _fail 取消态仍追加失败说明                      T030 迟到失败不覆盖取消
+                                                 1 failed / 2 passed
+
+--------------------------------------------------------------------------------
+四、T035 前端（失败文案可区分 + 重试入口 + 无永久「生成中」）
+--------------------------------------------------------------------------------
+· ERROR_TYPE_LABELS 补齐 budget_exhausted / interrupted——此前未知分类会以
+  原始英文标识符（"budget_exhausted"）直接展示给用户，属 FR-017 违规。
+· 新增 ERROR_TYPE_HINTS：把分类落到**用户动作**上（超出时间预算 → 精简/拆分需求，
+  重试同样会超时；上游不响应 → 稍后重试即可）。只并列两种说法而不说清该做什么，
+  用户仍会一直重试注定失败的请求。
+· 失败条给出「用原描述重新生成」按钮：handleSubmit 拆出 runGeneration(text)，
+  记住 submittedPrompt；switchVersion 打开失败版本时用 version.prompt 回填
+  （FR-019 的「描述已保留」由此变为可操作，刷新后依然有效）。
+· 不再永久「生成中」：轮询 12 分钟上限（> 后端 600s 回收）到点即落失败态。
+
+☆ 顺带发现（未改，仅记录）：app/frontend/package.json 的 "build" 只有
+  `vite build`，**不含 tsc**（CLAUDE.md 写的「tsc + vite build」与实际不符）。
+  vite 用 esbuild 剥类型不做检查，故本轮额外跑了 `npx tsc --noEmit`（exit 0）。
+  建议后续把 build 改成 `tsc --noEmit && vite build`，否则类型错误不会被 CI 拦住。
+
+--------------------------------------------------------------------------------
+五、T036 全量回归原始输出
+--------------------------------------------------------------------------------
+--- backend: cd app/backend && .venv/Scripts/python.exe -m pytest tests/ -q
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+157 passed, 4 warnings in 9.45s
+
+--- frontend: npm run lint / npm run build / npx tsc --noEmit
+lint:  exit 0 (eslint --quiet ./src，无输出)
+Prerendered 2 pages:
+  /
+  /blog/
+tsc:   exit 0 (npx tsc --noEmit，无输出)

@@ -35,9 +35,9 @@ description: "Task list for 增量可靠性与会话连续性加固"
 
 **Purpose**: 建立可复跑的留档与红灯基线。本特性的一切验收都依赖「有证据」，所以留档机制必须先落地。
 
-- [ ] T001 [P] 创建证据留档目录 `uploads/specs/002-harden-increment-session/evidence/` 并写 `README.md`，说明命名约定（`<日期>-<被测版本>-<场景>.txt`）与三个必留场景（本地回归、线上探针、两轮端到端）
+- [X] T001 [P] 创建证据留档目录 `uploads/specs/002-harden-increment-session/evidence/` 并写 `README.md`，说明命名约定（`<日期>-<被测版本>-<场景>.txt`）与三个必留场景（本地回归、线上探针、两轮端到端）
 
-- [ ] T002 [P] 录制红灯基线：在 `app/backend` 执行 `python -m pytest tests/ -q`，把完整输出（含 8 failed / 90 passed / 2 errors 的用例名）保存到 `uploads/specs/002-harden-increment-session/evidence/baseline-tests.txt`，作为后续「从红转绿」的对照物
+- [X] T002 [P] 录制红灯基线：在 `app/backend` 执行 `python -m pytest tests/ -q`，把完整输出（含 8 failed / 90 passed / 2 errors 的用例名）保存到 `uploads/specs/002-harden-increment-session/evidence/baseline-tests.txt`，作为后续「从红转绿」的对照物
 
 **Checkpoint**: 留档机制可用、基线可对照 —— 后续每个任务都能产出可验证证据
 
@@ -49,17 +49,17 @@ description: "Task list for 增量可靠性与会话连续性加固"
 
 **⚠️ CRITICAL**: 本阶段完成前，不要开始任何用户故事。理由：没有整体预算，US1 的验收场景 2（最坏情况下有明确上限）无法成立；没有删除心跳，US3 的"卡死回收"整条链是死的。
 
-- [ ] T003 在 `app/backend/services/pipeline.py` 声明 `GENERATION_BUDGET_SECONDS = 420.0`，并把 `STAGE_TIMEOUT` 由 240.0 降为 **120.0**、`MAX_ATTEMPTS` 由 3 降为 **2**、`RETRY_BACKOFF_SECONDS` 由 `(0.5, 1.0, 2.0)` 改为 `(0.5, 1.0)`；在常量块处附注释写明理由与不等关系 `120 < 420 < 600 < 720`（`STAGE_TIMEOUT=120` 取在上游实测 126.2s 返回 524 的切断点之内）
+- [X] T003 在 `app/backend/services/pipeline.py` 声明 `GENERATION_BUDGET_SECONDS = 420.0`，并把 `STAGE_TIMEOUT` 由 240.0 降为 **120.0**、`MAX_ATTEMPTS` 由 3 降为 **2**、`RETRY_BACKOFF_SECONDS` 由 `(0.5, 1.0, 2.0)` 改为 `(0.5, 1.0)`；在常量块处附注释写明理由与不等关系 `120 < 420 < 600 < 720`（`STAGE_TIMEOUT=120` 取在上游实测 126.2s 返回 524 的切断点之内）
 
-- [ ] T004 在 `app/backend/services/pipeline.py` 的流水线入口计算单调截止时刻 `deadline = monotonic() + GENERATION_BUDGET_SECONDS`，并新增 `_remaining()` 辅助；把 `_call_step` 内的调用超时由固定的 `STAGE_TIMEOUT` 改为 `min(STAGE_TIMEOUT, remaining)`（仅内存计算，**不得**引入跨 AI 调用的数据库事务）
+- [X] T004 在 `app/backend/services/pipeline.py` 的流水线入口计算单调截止时刻 `deadline = monotonic() + GENERATION_BUDGET_SECONDS`，并新增 `_remaining()` 辅助；把 `_call_step` 内的调用超时由固定的 `STAGE_TIMEOUT` 改为 `min(STAGE_TIMEOUT, remaining)`（仅内存计算，**不得**引入跨 AI 调用的数据库事务）
 
-- [ ] T005 在 `app/backend/services/pipeline.py` 实现**预算耗尽止损**：每个阶段发起调用**之前**若 `remaining` 低于最小可用调用预算，则不再发起调用，直接以 `PipelineError(..., error_type="budget_exhausted")` 落库失败，用户文案说明「本次生成超出时间预算，描述已保留，可重新提交」；该写入路径同样受 `if version.status in ACTIVE_STATUSES` 守卫（晚到的终态不得覆盖已写入的终态）
+- [X] T005 在 `app/backend/services/pipeline.py` 实现**预算耗尽止损**：每个阶段发起调用**之前**若 `remaining` 低于最小可用调用预算，则不再发起调用，直接以 `PipelineError(..., error_type="budget_exhausted")` 落库失败，用户文案说明「本次生成超出时间预算，描述已保留，可重新提交」；该写入路径同样受 `if version.status in ACTIVE_STATUSES` 守卫（晚到的终态不得覆盖已写入的终态）
 
-- [ ] T006 在 `app/backend/services/pipeline.py` **删除 `_heartbeat` 及其 `HEARTBEAT_INTERVAL` 常量**，并更新引用它的注释块；同时在原注释处写明确认结论：`versions.updated_at` 只在真实进展点（`_finish_step` 写摘要、`_fail` 写终态）推进，`_call_step` 置步骤 `running` 时改的是 `generation_steps` 行，**不**推进 `versions.updated_at`，故活任务最长静默期 = 阶段3 的预算 420s < `STALE_AFTER` 600s
+- [X] T006 在 `app/backend/services/pipeline.py` **删除 `_heartbeat` 及其 `HEARTBEAT_INTERVAL` 常量**，并更新引用它的注释块；同时在原注释处写明确认结论：`versions.updated_at` 只在真实进展点（`_finish_step` 写摘要、`_fail` 写终态）推进，`_call_step` 置步骤 `running` 时改的是 `generation_steps` 行，**不**推进 `versions.updated_at`，故活任务最长静默期 = 阶段3 的预算 420s < `STALE_AFTER` 600s
 
-- [ ] T007 [P] 新建 `app/backend/tests/test_time_budget_invariants.py`：断言 `GENERATION_BUDGET_SECONDS < STALE_AFTER.total_seconds() < FRONTEND_POLL_TIMEOUT`，其中 `FRONTEND_POLL_TIMEOUT` 从 `app/frontend/src/pages/Index.tsx` 的 `GENERATION_POLL_TIMEOUT_MS` **读取真实值**（不得在本测试内重新硬编码，否则又变成自证）
+- [X] T007 [P] 新建 `app/backend/tests/test_time_budget_invariants.py`：断言 `GENERATION_BUDGET_SECONDS < STALE_AFTER.total_seconds() < FRONTEND_POLL_TIMEOUT`，其中 `FRONTEND_POLL_TIMEOUT` 从 `app/frontend/src/pages/Index.tsx` 的 `GENERATION_POLL_TIMEOUT_MS` **读取真实值**（不得在本测试内重新硬编码，否则又变成自证）
 
-- [ ] T008 [P] 修复与身份无关的 6 个红灯，使这些用例转绿：`app/backend/tests/test_generation_inline.py`（3 个）、`app/backend/tests/test_fake_aihub.py`（1 个）、`app/backend/tests/test_conftest_smoke.py`（2 个 error）。根因是合并 `bd78a46` 拼接了两条谱系（实现文件来自一侧、测试由另一侧针对已被覆盖的实现编写），因此要么按当前实现修正断言，要么明确废弃并注明理由——**不得**为了让测试变绿而改动被测实现的行为
+- [X] T008 [P] 修复与身份无关的 6 个红灯，使这些用例转绿：`app/backend/tests/test_generation_inline.py`（3 个）、`app/backend/tests/test_fake_aihub.py`（1 个）、`app/backend/tests/test_conftest_smoke.py`（2 个 error）。根因是合并 `bd78a46` 拼接了两条谱系（实现文件来自一侧、测试由另一侧针对已被覆盖的实现编写），因此要么按当前实现修正断言，要么明确废弃并注明理由——**不得**为了让测试变绿而改动被测实现的行为
 
 **Checkpoint**: 预算与自终结原语就位、时间不等关系有测试守护、非身份类红灯清空 —— 三个用户故事现在可以并行开始
 
@@ -75,19 +75,19 @@ description: "Task list for 增量可靠性与会话连续性加固"
 
 > **先写测试，确认初始为红，再实现**
 
-- [ ] T009 [P] [US1] 在 `app/backend/tests/test_two_round_increment.py` 补测试：**增量基线必须是最近一个成功版本**——构造「第 1 轮成功、第 2 轮失败、第 3 轮请求」的序列，断言第 3 轮注入的 `previous_html` 是第 1 轮的产出，而不是第 2 轮的（也不为空）
+- [X] T009 [P] [US1] 在 `app/backend/tests/test_two_round_increment.py` 补测试：**增量基线必须是最近一个成功版本**——构造「第 1 轮成功、第 2 轮失败、第 3 轮请求」的序列，断言第 3 轮注入的 `previous_html` 是第 1 轮的产出，而不是第 2 轮的（也不为空）
 
-- [ ] T010 [P] [US1] 在 `app/backend/tests/test_two_round_increment.py` 补测试：**指代解析生效**——断言第二轮请求的消息中同时包含历史上下文块与 `ANAPHORA_HINT` 的指示内容（当前 `ANAPHORA_HINT` 在 `tests/` 下零引用，属 spec 第 8 条点名的缺口）
+- [X] T010 [P] [US1] 在 `app/backend/tests/test_two_round_increment.py` 补测试：**指代解析生效**——断言第二轮请求的消息中同时包含历史上下文块与 `ANAPHORA_HINT` 的指示内容（当前 `ANAPHORA_HINT` 在 `tests/` 下零引用，属 spec 第 8 条点名的缺口）
 
-- [ ] T011 [P] [US1] 在 `app/backend/tests/test_two_round_increment.py` 补测试：**上下文体积有上限**——覆盖 `PREVIOUS_HTML_MAX_CHARS` 与截断函数的实际生效（当前 `truncate_previous_html` / `truncate_continue_history` / `PREVIOUS_HTML_MAX_CHARS` / `CONTINUE_HISTORY_MAX_CHARS` 在 `tests/` 下零引用），断言超长输入被裁剪且轮次增加不导致体积线性增长
+- [X] T011 [P] [US1] 在 `app/backend/tests/test_two_round_increment.py` 补测试：**上下文体积有上限**——覆盖 `PREVIOUS_HTML_MAX_CHARS` 与截断函数的实际生效（当前 `truncate_previous_html` / `truncate_continue_history` / `PREVIOUS_HTML_MAX_CHARS` / `CONTINUE_HISTORY_MAX_CHARS` 在 `tests/` 下零引用），断言超长输入被裁剪且轮次增加不导致体积线性增长
 
 ### Implementation for User Story 1
 
-- [ ] T012 [US1] 在 `app/backend/services/pipeline.py` 核准并修正增量基线的选取：`generate` 传入的 `previous_html` 必须取该项目**最新 `succeeded` 版本**的页面；失败/取消版本不得进入候选（FR-002）
+- [X] T012 [US1] 在 `app/backend/services/pipeline.py` 核准并修正增量基线的选取：`generate` 传入的 `previous_html` 必须取该项目**最新 `succeeded` 版本**的页面；失败/取消版本不得进入候选（FR-002）
 
-- [ ] T013 [US1] 在 `app/backend/services/pipeline.py` 核准并修正需求历史的构造：`history_prompts` 只含该项目此前**成功**版本的需求描述、按序升序、受 `HISTORY_MAX_ITEMS` × `HISTORY_ITEM_CHARS` 约束（FR-003/FR-005）
+- [X] T013 [US1] 在 `app/backend/services/pipeline.py` 核准并修正需求历史的构造：`history_prompts` 只含该项目此前**成功**版本的需求描述、按序升序、受 `HISTORY_MAX_ITEMS` × `HISTORY_ITEM_CHARS` 约束（FR-003/FR-005）
 
-- [ ] T014 [US1] 扩展 `app/backend/e2e_two_round.py` 的**产物级**核对：对第二轮产物逐项断言第一轮已实现能力仍存在（计算器场景为 `+ - * / AC 显示 .`）、断言第二轮新增能力存在（`历史`）、断言长度比 `seq2/seq1 ≥ 0.80`、断言摘要自洽且以 `</html>` 结尾、断言第二轮结束后回取第一轮版本**逐字节不变**。仅断言"注入内容"不算通过（FR-006/FR-030）
+- [X] T014 [US1] 扩展 `app/backend/e2e_two_round.py` 的**产物级**核对：对第二轮产物逐项断言第一轮已实现能力仍存在（计算器场景为 `+ - * / AC 显示 .`）、断言第二轮新增能力存在（`历史`）、断言长度比 `seq2/seq1 ≥ 0.80`、断言摘要自洽且以 `</html>` 结尾、断言第二轮结束后回取第一轮版本**逐字节不变**。仅断言"注入内容"不算通过（FR-006/FR-030）
 
 **Checkpoint**: US1 可独立验证 —— 两轮增量在上限内到达终态，且旧功能保留有产物级证据
 
@@ -101,29 +101,29 @@ description: "Task list for 增量可靠性与会话连续性加固"
 
 ### Tests for User Story 2 ⚠️
 
-- [ ] T015 [P] [US2] 在 `app/backend/tests/test_owner_dependency.py` 修正/新增归属键测试并使 `test_distinct_long_subjects_yield_distinct_keys` 通过：三个不同 `sub`（长度 80 / 60 / 60、前缀相同）必须产出**三个不同** `owner_key`，且总长 ≤ 64
+- [X] T015 [P] [US2] 在 `app/backend/tests/test_owner_dependency.py` 修正/新增归属键测试并使 `test_distinct_long_subjects_yield_distinct_keys` 通过：三个不同 `sub`（长度 80 / 60 / 60、前缀相同）必须产出**三个不同** `owner_key`，且总长 ≤ 64
 
-- [ ] T016 [P] [US2] 在 `app/backend/tests/test_owner_dependency.py` 使 `test_missing_secret_warns_once` 通过，并补一项加固测试：`_verify` 收到 `None` 或非十六进制形状的签名时**拒绝**而不是抛 `AttributeError` 变成 500
+- [X] T016 [P] [US2] 在 `app/backend/tests/test_owner_dependency.py` 使 `test_missing_secret_warns_once` 通过，并补一项加固测试：`_verify` 收到 `None` 或非十六进制形状的签名时**拒绝**而不是抛 `AttributeError` 变成 500
 
-- [ ] T017 [P] [US2] 新建 `app/backend/tests/test_session_logout.py`：断言 `POST /api/v1/atoms/session/logout` 返回的 `anon_key` ≠ 旧值、`Set-Cookie` 同时下发新值、携新身份请求**看不到**旧身份的项目、连续调用幂等且各自返回可用新身份
+- [X] T017 [P] [US2] 新建 `app/backend/tests/test_session_logout.py`：断言 `POST /api/v1/atoms/session/logout` 返回的 `anon_key` ≠ 旧值、`Set-Cookie` 同时下发新值、携新身份请求**看不到**旧身份的项目、连续调用幂等且各自返回可用新身份
 
-- [ ] T018 [P] [US2] 在 `app/backend/tests/test_owner_dependency.py` 补 cookie 属性测试：HTTPS 请求的 `Set-Cookie` 含 `Secure`，HTTP 本地请求**不含**（保证本地开发与测试可回传）
+- [X] T018 [P] [US2] 在 `app/backend/tests/test_owner_dependency.py` 补 cookie 属性测试：HTTPS 请求的 `Set-Cookie` 含 `Secure`，HTTP 本地请求**不含**（保证本地开发与测试可回传）
 
 ### Implementation for User Story 2
 
-- [ ] T019 [US2] 在 `app/backend/dependencies/owner.py` 把登录身份归属键改为 **`"user:" + sha256(subject).hexdigest()[:32]`**（总长 37，长度无关地唯一），恢复 `_SUBJECT_CHARS = 32` 常量与「密钥缺失时告警一次」的行为；同时给 `_verify` 加 `None` 守卫与签名十六进制形状校验（FR-021/FR-024，修掉已本地实证的 3→1 碰撞）
+- [X] T019 [US2] 在 `app/backend/dependencies/owner.py` 把登录身份归属键改为 **`"user:" + sha256(subject).hexdigest()[:32]`**（总长 37，长度无关地唯一），恢复 `_SUBJECT_CHARS = 32` 常量与「密钥缺失时告警一次」的行为；同时给 `_verify` 加 `None` 守卫与签名十六进制形状校验（FR-021/FR-024，修掉已本地实证的 3→1 碰撞）
 
-- [ ] T020 [US2] 在 `app/backend/routers/atoms.py` 的 `_json()` 给 `set_cookie` 补 `secure`：由**请求实际 scheme** 推导（`https` → `Secure`），并提供环境变量覆盖以应对网关未传递 `X-Forwarded-Proto` 的情况；本地 HTTP 必须保持可回传（contracts/rest-api.md 变更 3）
+- [X] T020 [US2] 在 `app/backend/routers/atoms.py` 的 `_json()` 给 `set_cookie` 补 `secure`：由**请求实际 scheme** 推导（`https` → `Secure`），并提供环境变量覆盖以应对网关未传递 `X-Forwarded-Proto` 的情况；本地 HTTP 必须保持可回传（contracts/rest-api.md 变更 3）
 
-- [ ] T021 [US2] 在 `app/backend/routers/atoms.py` 新增 `POST /api/v1/atoms/session/logout`：删除旧 cookie 并**签发一个全新匿名身份**，经 `Set-Cookie` 与响应体两条通道一并下发，响应 `{"status":"ok","anon_key":"<新值>"}`；沿用既有错误信封与 `/api/v1/` 前缀（contracts/rest-api.md 变更 2）
+- [X] T021 [US2] 在 `app/backend/routers/atoms.py` 新增 `POST /api/v1/atoms/session/logout`：删除旧 cookie 并**签发一个全新匿名身份**，经 `Set-Cookie` 与响应体两条通道一并下发，响应 `{"status":"ok","anon_key":"<新值>"}`；沿用既有错误信封与 `/api/v1/` 前缀（contracts/rest-api.md 变更 2）
 
-- [ ] T022 [US2] 在 `app/frontend/src/lib/atoms.ts` 修正 `clearAnonKey` 的语义边界并新增登出调用：`HttpOnly` cookie 前端**原理上清不掉**，因此登出必须调用 T021 的后端端点（服务端下发删除 + 新身份），同时继续清 localStorage；确认身份优先级中 cookie 高于 `X-Atoms-Anon` 请求头这一事实已被正确处理
+- [X] T022 [US2] 在 `app/frontend/src/lib/atoms.ts` 修正 `clearAnonKey` 的语义边界并新增登出调用：`HttpOnly` cookie 前端**原理上清不掉**，因此登出必须调用 T021 的后端端点（服务端下发删除 + 新身份），同时继续清 localStorage；确认身份优先级中 cookie 高于 `X-Atoms-Anon` 请求头这一事实已被正确处理
 
-- [ ] T023 [US2] 在 `app/frontend/src/pages/Index.tsx` 实现**恢复上次打开的项目**：刷新后若存在上次打开的项目标识则自动载入（当前 `activeId` 初始为 `null`，工作区为空），并在切换/打开项目时清除旧 `html` 以避免闪现上一个项目的内容
+- [X] T023 [US2] 在 `app/frontend/src/pages/Index.tsx` 实现**恢复上次打开的项目**：刷新后若存在上次打开的项目标识则自动载入（当前 `activeId` 初始为 `null`，工作区为空），并在切换/打开项目时清除旧 `html` 以避免闪现上一个项目的内容
 
-- [ ] T024 [US2] 在 `app/frontend/src/pages/Index.tsx` 确认并补齐**进行中生成自动接回**：刷新时若存在 `pending`/`running` 版本则自动恢复 2.5s 轮询直至终态，用户无需重新提交（FR-027）
+- [X] T024 [US2] 在 `app/frontend/src/pages/Index.tsx` 确认并补齐**进行中生成自动接回**：刷新时若存在 `pending`/`running` 版本则自动恢复 2.5s 轮询直至终态，用户无需重新提交（FR-027）
 
-- [ ] T025 [US2] 新建 `app/backend/tests/test_source_preview_consistency.py` 实现**三方对照**（FR-033 / research.md R-10）：① `GET /versions/{seq}` 返回的 `html` 与 `html_sha256`；② 验证方**独立计算**的摘要（不得复用被测代码路径的公式）；③ 前端展示条与代码视图所依据的同一数据源。三者必须相等——用独立算法取代「同一公式复算同一响应体」的自证测试
+- [X] T025 [US2] 新建 `app/backend/tests/test_source_preview_consistency.py` 实现**三方对照**（FR-033 / research.md R-10）：① `GET /versions/{seq}` 返回的 `html` 与 `html_sha256`；② 验证方**独立计算**的摘要（不得复用被测代码路径的公式）；③ 前端展示条与代码视图所依据的同一数据源。三者必须相等——用独立算法取代「同一公式复算同一响应体」的自证测试
 
 **Checkpoint**: US2 可独立验证 —— 两条身份通道（cookie / header）都通过、跨身份隔离正确、登出无残留、刷新后逐字节一致
 
@@ -137,27 +137,27 @@ description: "Task list for 增量可靠性与会话连续性加固"
 
 ### Tests for User Story 3 ⚠️
 
-- [ ] T026 [P] [US3] 在 `app/backend/tests/test_pipeline_recovery.py` 补测试：**内部异常从 `_call_step` 重试 try 之外逃逸**（在 `_get_version` / `_get_step` / `await self._db.commit()` / `GenTxtRequest` 构造处注入异常）→ 断言失败阶段是**流水线实际所在阶段**而非硬编码的 3，且该版本下**不存在**残留 `running` 步骤（FR-014/FR-015/SC-005）
+- [X] T026 [P] [US3] 在 `app/backend/tests/test_pipeline_recovery.py` 补测试：**内部异常从 `_call_step` 重试 try 之外逃逸**（在 `_get_version` / `_get_step` / `await self._db.commit()` / `GenTxtRequest` 构造处注入异常）→ 断言失败阶段是**流水线实际所在阶段**而非硬编码的 3，且该版本下**不存在**残留 `running` 步骤（FR-014/FR-015/SC-005）
 
-- [ ] T027 [P] [US3] 新建 `app/backend/tests/test_budget_exhaustion.py`：注入一个永不返回的上游 → 断言版本在**预算附近**（而非 6 倍预算）落到 `failed`、`error_type` 为可区分于上游超时的值、`html` 为空、`prompt` 保留，且紧接着再次 `generate` **被受理**（FR-007/FR-009/FR-018/FR-019）
+- [X] T027 [P] [US3] 新建 `app/backend/tests/test_budget_exhaustion.py`：注入一个永不返回的上游 → 断言版本在**预算附近**（而非 6 倍预算）落到 `failed`、`error_type` 为可区分于上游超时的值、`html` 为空、`prompt` 保留，且紧接着再次 `generate` **被受理**（FR-007/FR-009/FR-018/FR-019）
 
-- [ ] T028 [P] [US3] 在 `app/backend/tests/test_pipeline_recovery.py` 补**五类故障的失败记录完整性**测试：限流耗尽（含 `attempts`）、鉴权失败（立即失败且 `attempts == 1`、不做无谓重试）、上游 5xx（含 `upstream_status`）、截断（`error_type == "truncated"`）、空产出；每类均断言 `error` 可读无堆栈、`html` 为空、未产生多余版本（FR-013/FR-016/FR-017/SC-004）
+- [X] T028 [P] [US3] 在 `app/backend/tests/test_pipeline_recovery.py` 补**五类故障的失败记录完整性**测试：限流耗尽（含 `attempts`）、鉴权失败（立即失败且 `attempts == 1`、不做无谓重试）、上游 5xx（含 `upstream_status`）、截断（`error_type == "truncated"`）、空产出；每类均断言 `error` 可读无堆栈、`html` 为空、未产生多余版本（FR-013/FR-016/FR-017/SC-004）
 
-- [ ] T029 [P] [US3] 扩展 `app/backend/tests/test_stale_recovery.py`：构造一个 `running` 且 `updated_at` 陈旧的版本 → 调用 **`GET /projects/{id}/versions/{seq}/steps`** → 断言返回 `failed`、`error_type` **非空**（当前回收路径写入 `None`，是缺陷）、版本数量不变、且该端点调用后同一项目再次 `generate` 被受理（contracts/rest-api.md 变更 1 + 4）
+- [X] T029 [P] [US3] 扩展 `app/backend/tests/test_stale_recovery.py`：构造一个 `running` 且 `updated_at` 陈旧的版本 → 调用 **`GET /projects/{id}/versions/{seq}/steps`** → 断言返回 `failed`、`error_type` **非空**（当前回收路径写入 `None`，是缺陷）、版本数量不变、且该端点调用后同一项目再次 `generate` 被受理（contracts/rest-api.md 变更 1 + 4）
 
-- [ ] T030 [P] [US3] 新建 `app/backend/tests/test_cancel_live_task.py`，运行在**非 `GENERATION_INLINE`** 模式：用 `_PIPELINE_AI_FACTORY` 注入一个**阻塞在 `asyncio.Event` 上**的假上游，使真实后台任务稳定停驻在某阶段，然后调用 `POST /versions/{seq}/cancel`，断言版本、步骤、项目三者都落到 `cancelled`，且 `_RUNNING_TASKS` 中注册的任务被**真正取消**。这是当前 `GENERATION_INLINE=1` 下结构性不可达的路径（FR-032）
+- [X] T030 [P] [US3] 新建 `app/backend/tests/test_cancel_live_task.py`，运行在**非 `GENERATION_INLINE`** 模式：用 `_PIPELINE_AI_FACTORY` 注入一个**阻塞在 `asyncio.Event` 上**的假上游，使真实后台任务稳定停驻在某阶段，然后调用 `POST /versions/{seq}/cancel`，断言版本、步骤、项目三者都落到 `cancelled`，且 `_RUNNING_TASKS` 中注册的任务被**真正取消**。这是当前 `GENERATION_INLINE=1` 下结构性不可达的路径（FR-032）
 
 ### Implementation for User Story 3
 
-- [ ] T031 [US3] 在 `app/backend/services/pipeline.py` 修正 `_run_stages` 的通用 `except Exception` 兜底：把硬编码的 `step_seq=3` 改为**流水线实际所在阶段**（由 `_call_step` 进入时记录的自有状态提供）、补齐 `attempts`，并在 `summary` 中记录**异常类名**以保留可观测性。**不要**把 `_call_step` 中 try 之外的语句移进 try——那会把「我们自己的代码/数据库故障」误分类成「上游错误」而触发无效重试（research.md R-4）
+- [X] T031 [US3] 在 `app/backend/services/pipeline.py` 修正 `_run_stages` 的通用 `except Exception` 兜底：把硬编码的 `step_seq=3` 改为**流水线实际所在阶段**（由 `_call_step` 进入时记录的自有状态提供）、补齐 `attempts`，并在 `summary` 中记录**异常类名**以保留可观测性。**不要**把 `_call_step` 中 try 之外的语句移进 try——那会把「我们自己的代码/数据库故障」误分类成「上游错误」而触发无效重试（research.md R-4）
 
-- [ ] T032 [US3] 在 `app/backend/services/pipeline.py` 的 `_fail` 增加**收尾清扫**：把该版本下仍为 `running` 的步骤一并置为 `failed`，已在成功阶段完成的步骤保持 `succeeded`（FR-015/INV-S2）
+- [X] T032 [US3] 在 `app/backend/services/pipeline.py` 的 `_fail` 增加**收尾清扫**：把该版本下仍为 `running` 的步骤一并置为 `failed`，已在成功阶段完成的步骤保持 `succeeded`（FR-015/INV-S2）
 
-- [ ] T033 [US3] 在 `app/backend/routers/atoms.py` 为 `GET /projects/{public_id}/versions/{seq}/steps` 补齐 `_recover_stale_versions`（限本人归属，与其它路由一致），并让**回收路径写入非空的 `error_type`**。响应结构不变；`status` 可能因回收由 `running` 变为 `failed`，属期望行为（contracts/rest-api.md 变更 1）
+- [X] T033 [US3] 在 `app/backend/routers/atoms.py` 为 `GET /projects/{public_id}/versions/{seq}/steps` 补齐 `_recover_stale_versions`（限本人归属，与其它路由一致），并让**回收路径写入非空的 `error_type`**。响应结构不变；`status` 可能因回收由 `running` 变为 `failed`，属期望行为（contracts/rest-api.md 变更 1）
 
-- [ ] T034 [US3] 在 `app/backend/services/aihub.py` 的 `AIHubService.__init__` 为 `AsyncOpenAI(...)` 显式设置 `timeout=STAGE_TIMEOUT` 与 `max_retries=1`，不依赖库默认值——库默认值会与自有 `wait_for` 叠加，使实际等待不可预测（FR-012 / research.md R-9）
+- [X] T034 [US3] 在 `app/backend/services/aihub.py` 的 `AIHubService.__init__` 为 `AsyncOpenAI(...)` 显式设置 `timeout=STAGE_TIMEOUT` 与 `max_retries=1`，不依赖库默认值——库默认值会与自有 `wait_for` 叠加，使实际等待不可预测（FR-012 / research.md R-9）
 
-- [ ] T035 [US3] 在 `app/frontend/src/pages/Index.tsx` 区分失败文案与提供重试入口：「超出时间预算」（平台侧止损）与「上游不可用」（上游不响应）必须给出**可区分**的说明，失败后展示重试入口并保留原描述，不再出现永久「生成中」（FR-017）
+- [X] T035 [US3] 在 `app/frontend/src/pages/Index.tsx` 区分失败文案与提供重试入口：「超出时间预算」（平台侧止损）与「上游不可用」（上游不响应）必须给出**可区分**的说明，失败后展示重试入口并保留原描述，不再出现永久「生成中」（FR-017）
 
 **Checkpoint**: 三个用户故事均可独立验证 —— 失败可理解、可重试、可观测，且无版本会无限期停留「进行中」
 
@@ -165,15 +165,40 @@ description: "Task list for 增量可靠性与会话连续性加固"
 
 ## Phase 6: Polish & Cross-Cutting Concerns
 
-- [ ] T036 [P] 全量回归：在 `app/backend` 执行 `python -m pytest tests/ -q` 断言 **0 failed / 0 errors**（SC-011），在 `app/frontend` 执行 `npm run lint && npm run build`，两侧结果留档到 `evidence/`
+- [X] T036 [P] 全量回归：在 `app/backend` 执行 `python -m pytest tests/ -q` 断言 **0 failed / 0 errors**（SC-011），在 `app/frontend` 执行 `npm run lint && npm run build`，两侧结果留档到 `evidence/`
+  > 结果：后端 **157 passed / 0 failed / 0 errors**；前端 `npm run lint` 与 `npm run build` 均通过。**额外发现**：`npm run build` 是 `vite build`，esbuild 会剥离类型而不报错，故另跑 `npx tsc --noEmit`（exit 0）才算类型验证通过——`CLAUDE.md` 写的「tsc + vite build」与 `package.json` 不符。原始输出见 `evidence/2026-09-21-local-us3-budget-cancel.txt`。
 
 - [ ] T037 [P] 线上证据采集（**消耗真实模型配额**）：依次运行 `app/backend/probe_upstream.py`（判断上游是否仍是瓶颈）与 `app/backend/e2e_two_round.py`（两轮增量 + 旧功能保留 + 会话恢复），输出留档到 `evidence/`（SC-012）
+  > **标注为「待部署后执行」，非跳过**（用户决策）。理由：线上 `keegan.pub.atoms.world` 跑的是平台上一次发布的构建，本分支尚未部署；此时运行探针验证的是**旧构建**，却要消耗真实模型配额并创建真实公开项目。故本项在**本分支部署验收之后**执行。前置条件与预期产物见 `evidence/README.md`。
 
-- [ ] T038 [P] 更新 `docs/验收复核报告-生成流水线与归属隔离.md`：逐条标注每个已确认缺陷的修复状态与对应任务号，并补充本次新增的会话侧发现（`Secure` / 登出清 cookie / 恢复上次项目）
+- [X] T038 [P] 更新 `docs/验收复核报告-生成流水线与归属隔离.md`：逐条标注每个已确认缺陷的修复状态与对应任务号，并补充本次新增的会话侧发现（`Secure` / 登出清 cookie / 恢复上次项目）
+  > 结果：正文 1–6 节的复核记录与实测证据**原样保留**（它们是修复依据，不被事后结果覆盖），每条结论后补【修复状态 · 任务号】；§0 表加「修复状态」列；§3 覆盖缺口表加「补齐状态」列；§5 的 16 条逐条内联标注（含**方案有调整**与**未完成**的如实说明）；§6 把「未执行」更新为补做结果与缺口；新增 §7 会话侧发现、§8 任务映射与 5 条「仍未完成项」。诚实标注两处未按方案落地：`_FALLBACK_SECRET` 仍在（仅恢复了告警）、平台侧日志仍不可取。
 
-- [ ] T039 处置未跟踪的探针产物：`app/backend/e2e_acceptance.py`、`e2e_two_round.py`、`probe_upstream.py` 与 `_det.json`、`_s2.json`、`_s3.json`、`_s4.json`、`_s4b.json`、`_steps.json`、`_v1.json`、`_v2.json`、`_v2b.json`、`_v2c.json`、`_ver.json`——脚本按 `quickstart.md` 的定位纳入版本管理，中间 JSON 转储删除或移入被忽略的目录。同时提示用户：复核期间在线上创建了 3 个测试项目并消耗了模型配额
+- [X] T039 处置未跟踪的探针产物：`app/backend/e2e_acceptance.py`、`e2e_two_round.py`、`probe_upstream.py` 与 `_det.json`、`_s2.json`、`_s3.json`、`_s4.json`、`_s4b.json`、`_steps.json`、`_v1.json`、`_v2.json`、`_v2b.json`、`_v2c.json`、`_ver.json`——脚本按 `quickstart.md` 的定位纳入版本管理，中间 JSON 转储删除或移入被忽略的目录。同时提示用户：复核期间在线上创建了 3 个测试项目并消耗了模型配额
+  > 结果：三个脚本**已在版本管理中**（`git ls-files` 三行均可见，无需新增）；11 个 `_*.json` **已在被忽略路径**（`git check-ignore -v` 命中 `.gitignore:62` 的 `app/backend/_*.json`，`git status` 中不再出现），按任务书「删除**或**移入被忽略的目录」的后一种方式处置，保留现场供后续排查。副作用提示已写入复核报告 §6。
 
-- [ ] T040 按 `uploads/specs/002-harden-increment-session/quickstart.md` 完整走一遍验证流程，确认指南本身可执行、命令无误、期望值与实现一致
+- [X] T040 按 `uploads/specs/002-harden-increment-session/quickstart.md` 完整走一遍验证流程，确认指南本身可执行、命令无误、期望值与实现一致
+  > **走查查出的指南缺陷（已就地修正）**：
+  > ① §二 引用的 `tests/test_pipeline_budget.py` **不存在**——实际文件是
+  > `tests/test_budget_exhaustion.py`，照原样执行会得到「file not found」而非验证结果；
+  > ② §一 说「当前基线为 8 failed / 90 passed / 2 errors」，那是**开工时**的红基线，
+  > 作为「期望值」会让人以为套件本该是红的，已改为 `157 passed` 并保留红基线的作用说明
+  > （对照物在 `evidence/baseline-tests.txt`）；
+  > ③ §二 第 6 条的不等关系漏了最前一项，写成 `BUDGET < STALE_AFTER < FRONTEND_POLL_TIMEOUT`，
+  > 实际实现是四项 `STAGE_TIMEOUT(120) < GENERATION_BUDGET_SECONDS(420) < STALE_AFTER(600) < 前端上限(720)`；
+  > ④ §二 未提到 `tests/test_time_budget_invariants.py`（该不等关系的哨兵），已补入命令清单。
+  >
+  > **追加的实测与提示**：五个故障注入文件 **38 passed / 6.06s**；
+  > `test_owner_dependency.py` **33 passed / 0.80s**；前端 `npm run lint` 与
+  > `npm run build` 通过，并**额外跑 `npx tsc --noEmit`（exit 0）**——指南原写
+  > `npm run build` 即完成前端检查，但 `build` 实为 `vite build`，不做类型检查（已在 §三 加警示）；
+  > §四 加了「必须部署后执行」的前置说明与 venv 解释器提示（硬编码线上 `BASE`；
+  > 系统 python 缺 `httpx`）。
+  >
+  > **顺带修掉的一处规格不一致**：`plan.md` Open Questions 第 1 条写「定档 480s」，
+  > 与 `research.md` 的 420s 及实现不符。**未改写原文**（保留决策记录），改在原处加注
+  > 说明取 420s 的理由；同时给第 2、3 条也补了落地/未落地标注
+  > （第 2 条已实现但「部署侧是否传 `X-Forwarded-Proto`」仍未确认）。
 
 ---
 

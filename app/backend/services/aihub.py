@@ -89,9 +89,22 @@ class AIHubService:
         if settings.app_ai_base_url and settings.app_ai_key:
             from openai import AsyncOpenAI
 
+            # 显式声明等待上限与库级重试次数（FR-012 / research.md R-9），
+            # 不依赖库默认值：实测 openai 2.x 默认 read=600s、max_retries=2，
+            # 会与流水线自有的 asyncio.wait_for(STAGE_TIMEOUT) 叠加——自有超时
+            # 先放弃，库仍在后台等满 600s，每次尝试都留下一条悬挂连接。
+            # timeout 与 STAGE_TIMEOUT 对齐，保证「单次等待」只有一个口径。
+            # 延迟导入：services.pipeline 在模块级导入本模块，此处再在模块级
+            # 反向导入会成环；本文件对 openai 也是同样的延迟导入写法。
+            from services.pipeline import STAGE_TIMEOUT
+
             self.client = AsyncOpenAI(
                 api_key=settings.app_ai_key,
                 base_url=settings.app_ai_base_url.rstrip("/"),
+                timeout=STAGE_TIMEOUT,
+                # 保留一次库级重试（对连接抖动有效）。它同样受预算约束：
+                # wait_for 包在整次调用之外，库级重试不会造成预算外放大。
+                max_retries=1,
             )
 
     def _require_ai_client(self) -> "AsyncOpenAI":
