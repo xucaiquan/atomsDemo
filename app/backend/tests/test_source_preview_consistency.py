@@ -230,6 +230,85 @@ def test_frontend_views_read_html_and_digest_from_one_response():
     assert "sha256" in code_viewer_src, "CodeViewer 没有接收摘要 prop"
 
 
+# ---------------------------------------------------------------- 多版本切换（v3 → v1）
+
+
+async def test_switching_back_to_v1_returns_v1_content_and_digest(
+    client, inject_fake_ai
+):
+    """同一需求迭代出 v1/v2/v3 后，切回任一历史版本必须拿到**那一版**的内容。
+
+    这是「从 v3 切到 v1，源码和预览都展示 v1」的后端保证。前端的预览与源码共用
+    同一份 `html` 状态（见 test_frontend_views_read_html_and_digest_from_one_source
+    的源码级断言），因此只要版本详情接口按 seq 返回各自的内容与摘要，两个视图就
+    不可能分叉——切换正确性完全落在这个接口上。
+
+    断言不止「v1 内容对」，还要求三版**互不相同**：若三版内容恰好一样，上面那条
+    断言会在接口把 seq 完全忽略、永远返回最新版的情况下依然通过，退化成空转。
+    """
+    pid = await _create_project(client)
+
+    seqs = []
+    for round_no, marker in enumerate(("第一版内容", "第二版内容", "第三版内容"), 1):
+        inject_fake_ai(_fake_hub(make_html(marker)))
+        accepted = await client.post(
+            f"/api/v1/atoms/projects/{pid}/generate",
+            json={"prompt": f"第 {round_no} 轮需求"},
+        )
+        assert accepted.status_code == 202, accepted.text
+        seqs.append(accepted.json()["version_seq"])
+
+    assert seqs == [1, 2, 3], f"迭代应产出连续递增的版本号，实际 {seqs}"
+
+    details = {seq: await _get_version(client, pid, seq) for seq in seqs}
+
+    # 三版内容与摘要两两不同，否则下面的「切回 v1」断言不具鉴别力
+    htmls = {seq: d["html"] for seq, d in details.items()}
+    shas = {seq: d["html_sha256"] for seq, d in details.items()}
+    assert len(set(htmls.values())) == 3, "三个版本内容相同，切换断言会退化成空转"
+    assert len(set(shas.values())) == 3, "三个版本摘要相同，切换断言会退化成空转"
+
+    # 切回 v1：拿到的必须是 v1 的正文，且不含后续版本的任何标记
+    v1 = details[1]
+    assert "第一版内容" in v1["html"]
+    assert "第二版内容" not in v1["html"]
+    assert "第三版内容" not in v1["html"]
+    assert v1["seq"] == 1
+    # 摘要与正文自洽（独立复算），保证展示条标识的就是这份 v1 正文
+    assert v1["html_sha256"] == _independent_sha256(v1["html"])
+
+    # 反向再确认一次：v3 仍是 v3，切换没有污染其它版本
+    assert "第三版内容" in details[3]["html"]
+    assert details[3]["html_sha256"] == _independent_sha256(details[3]["html"])
+
+
+async def test_iterating_does_not_mutate_earlier_versions(client, inject_fake_ai):
+    """新版本产出后，历史版本的 html 与摘要必须逐字节不变（版本不可变）。
+
+    切换能用的前提是历史版本**还在且没被改写**。若迭代时就地覆盖了旧行，
+    「切到 v1」拿到的会是被改写过的 v1，界面上看不出任何异常。
+    """
+    pid = await _create_project(client)
+
+    inject_fake_ai(_fake_hub(make_html("原始版本")))
+    first = await client.post(
+        f"/api/v1/atoms/projects/{pid}/generate", json={"prompt": "初版"}
+    )
+    assert first.status_code == 202, first.text
+    before = await _get_version(client, pid, first.json()["version_seq"])
+
+    inject_fake_ai(_fake_hub(make_html("迭代版本")))
+    second = await client.post(
+        f"/api/v1/atoms/projects/{pid}/generate", json={"prompt": "加个按钮"}
+    )
+    assert second.status_code == 202, second.text
+    assert second.json()["version_seq"] != first.json()["version_seq"]
+
+    after = await _get_version(client, pid, first.json()["version_seq"])
+    assert after["html"] == before["html"], "迭代后 v1 的 html 被改写了"
+    assert after["html_sha256"] == before["html_sha256"], "迭代后 v1 的摘要变了"
+
+
 # ---------------------------------------------------------------- 局部工具
 
 

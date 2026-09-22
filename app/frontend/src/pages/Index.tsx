@@ -277,7 +277,11 @@ export default function Index() {
     async (seq: number) => {
       if (!activeId) return;
       setActiveSeq(seq);
-      setView('preview');
+      // 注意：这里**不能**强制 setView('preview')。源码与预览渲染的是同一份
+      // `html` 状态（见文件末尾：PreviewPane 与 CodeViewer 同取 html），所以
+      // 切换版本时两边本就一致；但若强行把视图拨回预览，正在对比 v3/v1 源码
+      // 的用户每点一次版本就被踢出源码页，等于「源码无法按版本查看」。
+      // 保持用户当前所在视图，切换的只是数据。
       // 先清空旧 HTML：加载中不会把旧版本内容标成新版本（过渡态修复）
       setHtml('');
       setHtmlSha256('');
