@@ -88,6 +88,11 @@ export interface VersionBrief {
   prompt: string;
   status: VersionStatus;
   error: string | null;
+  /**
+   * 上游/平台失败分类。刷新落地后前端只拿得到项目详情里的版本列表，若这里没有
+   * 分类，就无法判断上一次失败是否属于超时，也就谈不上「刷新后接着重试」。
+   */
+  error_type?: string | null;
   duration_ms: number | null;
   created_at: string | null;
   steps: GenerationStep[];
@@ -143,6 +148,8 @@ export interface StepsSnapshot {
   version_seq: number;
   status: VersionStatus;
   error: string | null;
+  /** 这一轮的原始描述：超时重试弹窗据此用原描述重新生成，无需用户重打。 */
+  prompt?: string;
   /** 失败分类（S3.5），后端 steps 接口从 summary 派生。 */
   error_type?: string | null;
   steps: GenerationStep[];

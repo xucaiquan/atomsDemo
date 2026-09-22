@@ -21,6 +21,7 @@ import {
   MessageSquare,
   MonitorPlay,
   Plus,
+  RotateCcw,
   Sparkles,
   Wand2,
 } from 'lucide-react';
@@ -32,6 +33,16 @@ import PreviewPane from '@/components/PreviewPane';
 import ProjectList from '@/components/ProjectList';
 import PromptInput from '@/components/PromptInput';
 import VersionSwitcher from '@/components/VersionSwitcher';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import { useAuth } from '@/contexts/AuthContext';
 import {
@@ -90,6 +101,52 @@ const ERROR_TYPE_HINTS: Record<string, string> = {
 };
 
 /**
+ * 判定某次失败是否属于「超时/中断」——即**重试有意义**的那一类。
+ *
+ * 只对这三类弹窗询问重试：
+ *  - `timeout`：上游没在阶段超时内响应，通常是偶发，重试大概率能过；
+ *  - `budget_exhausted`：平台侧总预算止损，重试同样描述可能再次超时，但用户
+ *    仍有权决定（弹窗里会给出「精简后再试」的提示，而不是替他决定放弃）；
+ *  - `interrupted`：服务重启/连接断开导致的陈旧回收，与需求本身无关，重试必要。
+ *
+ * 其余分类（auth 需要管理员、truncated 需精简描述等）不弹窗：对这些失败反复
+ * 弹「要不要重试」只会诱导用户重复触发一个注定失败的请求。
+ */
+const RETRYABLE_TIMEOUT_TYPES = new Set(['timeout', 'budget_exhausted', 'interrupted']);
+
+function isTimeoutFailure(errorType: string | null | undefined): boolean {
+  return !!errorType && RETRYABLE_TIMEOUT_TYPES.has(errorType);
+}
+
+/**
+ * 已询问过的失败版本标识。存在 sessionStorage 而非内存：
+ * 「刷新后自动重试」的前提是刷新会丢掉内存状态，若只记在内存里，用户每按一次
+ * F5 都会被同一个已经拒绝过的失败版本再问一遍，变成骚扰。用 session 级存储则
+ * 是「本次浏览会话内问过就不再问」，关掉标签页重开时重新询问，符合预期。
+ */
+const ASKED_RETRY_KEY = 'atoms_asked_retry';
+
+function hasAskedRetry(key: string): boolean {
+  try {
+    return (sessionStorage.getItem(ASKED_RETRY_KEY) || '').split(',').includes(key);
+  } catch {
+    return false;
+  }
+}
+
+function markAskedRetry(key: string): void {
+  try {
+    const raw = sessionStorage.getItem(ASKED_RETRY_KEY) || '';
+    const items = raw ? raw.split(',') : [];
+    if (!items.includes(key)) items.push(key);
+    // 只保留最近 20 条，避免会话里堆积无限增长
+    sessionStorage.setItem(ASKED_RETRY_KEY, items.slice(-20).join(','));
+  } catch {
+    /* 隐私模式下忽略：退化为每次刷新都询问，仍然可用 */
+  }
+}
+
+/**
  * 上次打开的项目标识（FR-026：刷新后回到原来的地方）。
  *
  * 只存 public_id，不存项目内容——内容必须重新从服务端取，避免拿本地副本
@@ -139,6 +196,18 @@ export default function Index() {
   const [activeSeq, setActiveSeq] = useState<number | null>(null);
   const [view, setView] = useState<'preview' | 'code'>('preview');
 
+  /**
+   * 超时重试询问弹窗。两个触发来源共用同一套状态：
+   *  ① 生成过程中当场超时；② 刷新后发现上一次是超时失败。
+   * 带上 prompt 是因为弹窗里的「立即重试」必须用**那一次的原描述**，而不是
+   * 输入框当前内容——受理时输入框已被清空，刷新后更是空的。
+   */
+  const [retryPrompt, setRetryPrompt] = useState<{
+    prompt: string;
+    errorType: string | null;
+    error: string | null;
+  } | null>(null);
+
   // ---------------- 数据加载 ----------------
   const refreshProjects = useCallback(async () => {
     try {
@@ -168,6 +237,7 @@ export default function Index() {
     setActiveSeq(null);
     setFailedMessage(null);
     setFailedType(null);
+    setRetryPrompt(null);
     setPrompt('');
     setView('preview');
   }, []);
@@ -412,8 +482,20 @@ export default function Index() {
     } else {
       setFailedMessage(snapshot.error || '生成失败，你的描述已保留');
       setFailedType(snapshot.error_type || null);
-      toast.error(snapshot.error || '生成失败，你的描述已保留');
       if (snapshot.steps.length) setSteps(snapshot.steps);
+      // 超时类失败优先弹窗询问，而不是只丢一条一闪而过的 toast：用户盯着
+      // 进度等了十几分钟，最需要的就是一个明确的「要不要再来一次」的出口。
+      // 非超时类（鉴权/截断等）仍走 toast + 失败条，重试对它们没有意义。
+      if (isTimeoutFailure(snapshot.error_type)) {
+        markAskedRetry(`${publicId}:${snapshot.version_seq}`);
+        setRetryPrompt({
+          prompt: snapshot.prompt || '',
+          errorType: snapshot.error_type || null,
+          error: snapshot.error || null,
+        });
+      } else {
+        toast.error(snapshot.error || '生成失败，你的描述已保留');
+      }
     }
     try {
       const [list, data] = await Promise.all([
@@ -522,6 +604,41 @@ export default function Index() {
 
   // 组件卸载时清理轮询定时器
   useEffect(() => stopPolling, [stopPolling]);
+
+  // ---------------- 刷新后自动接续：上一次超时失败 → 询问是否重试 ----------------
+  // 用户遇到阶段三超时后，最常见的动作就是刷新页面看看好没好。此前刷新落地
+  // 只剩一条静态的失败条，用户得自己找到「用原描述重新生成」按钮；现在在项目
+  // 详情就绪后主动识别**最新**那个超时失败版本并弹窗询问。
+  //
+  // 只看最新版本而不是「任何超时失败版本」：历史上失败过、后来又成功的版本
+  // 不该再被翻出来打扰；只有当项目当前停在超时失败上，重试才是用户想要的。
+  // 正在生成（含刷新后接回的后台任务）时不弹——那时该等终态，不是问重试。
+  useEffect(() => {
+    if (!detail || isGenerating || retryPrompt) return;
+    if (detail.is_demo) return; // 演示项目只读，不能生成
+    const latest = [...detail.versions].sort((a, b) => b.seq - a.seq)[0];
+    if (!latest || latest.status !== 'failed') return;
+    if (!isTimeoutFailure(latest.error_type)) return;
+    const key = `${detail.public_id}:${latest.seq}`;
+    if (hasAskedRetry(key)) return; // 本次会话已问过且被拒绝，不再反复打扰
+    markAskedRetry(key);
+    setRetryPrompt({
+      prompt: latest.prompt || '',
+      errorType: latest.error_type || null,
+      error: latest.error || null,
+    });
+  }, [detail, isGenerating, retryPrompt]);
+
+  /** 弹窗里的「立即重试」：用那一次的原描述重新生成。 */
+  const handleConfirmRetry = useCallback(() => {
+    const text = retryPrompt?.prompt || submittedPrompt;
+    setRetryPrompt(null);
+    if (!text) {
+      toast.error('未能找回原描述，请在下方重新输入');
+      return;
+    }
+    void runGeneration(text);
+  }, [retryPrompt, submittedPrompt, runGeneration]);
 
   // ---------------- 停止生成（任务中断能力） ----------------
   const handleStop = useCallback(async () => {
@@ -821,6 +938,61 @@ export default function Index() {
           </div>
         </main>
       </div>
+
+      {/* ---------------- 超时重试询问弹窗 ---------------- */}
+      {/* 两个入口共用：①生成中当场超时 ②刷新后发现上次停在超时失败。
+          「稍后再说」只关弹窗，失败条与「用原描述重新生成」按钮仍在，用户
+          随时可以自己触发——弹窗是把出口送到眼前，不是唯一出口。 */}
+      <AlertDialog
+        open={!!retryPrompt}
+        onOpenChange={(open) => {
+          if (!open) setRetryPrompt(null);
+        }}
+      >
+        <AlertDialogContent className="border-slate-800 bg-slate-900 text-slate-100">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2 text-slate-100">
+              <RotateCcw className="h-4 w-4 text-amber-400" />
+              生成超时，是否重试？
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2 text-slate-400">
+                <p>
+                  {retryPrompt?.error || '本次生成未能在预期时间内完成。'}
+                  {retryPrompt?.errorType && (
+                    <span className="ml-1.5 rounded border border-slate-700 px-1 py-0.5 font-mono text-[10px] text-slate-400">
+                      {ERROR_TYPE_LABELS[retryPrompt.errorType] || retryPrompt.errorType}
+                    </span>
+                  )}
+                </p>
+                <p className="text-[11px] text-amber-400/90">
+                  {ERROR_TYPE_HINTS[retryPrompt?.errorType || ''] ||
+                    '你的描述已保留，可直接重新生成'}
+                </p>
+                {retryPrompt?.prompt && (
+                  <p className="rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-[11px] text-slate-300">
+                    将用原描述重试：{retryPrompt.prompt}
+                  </p>
+                )}
+                <p className="text-[11px] text-slate-500">
+                  之前成功的版本不受影响，重试会生成新版本。
+                </p>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="border-slate-700 !bg-transparent text-slate-300 hover:!bg-transparent hover:text-white">
+              稍后再说
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleConfirmRetry}
+              className="bg-sky-500 text-white hover:bg-sky-400"
+            >
+              立即重试
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

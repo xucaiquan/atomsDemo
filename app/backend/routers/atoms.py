@@ -169,12 +169,20 @@ def _project_brief(project: Projects) -> dict[str, Any]:
 
 
 def _version_brief(version: Versions, steps: list[Generation_steps]) -> dict[str, Any]:
-    """版本列表条目，不含 html。"""
+    """版本列表条目，不含 html。
+
+    附带 ``error_type``：刷新后前端要据此判断「上一次失败是不是超时」，从而
+    决定是否弹出重试询问。列表接口是刷新落地后第一个（也常常是唯一一个）拿到
+    的数据源，若只在版本详情里给分类，前端就得为每个失败版本再打一次详情请求
+    才能知道失败原因，纯属多余往返。
+    """
+    summary = _parse_summary(version.summary)
     return {
         "seq": version.seq,
         "prompt": version.prompt,
         "status": version.status,
         "error": version.error,
+        "error_type": (summary or {}).get("error_type"),
         "duration_ms": version.duration_ms,
         "created_at": _iso(version.created_at),
         "steps": [
@@ -854,6 +862,9 @@ async def get_version_steps(
         "version_seq": version.seq,
         "status": version.status,
         "error": version.error,
+        # 这一轮的原始描述：超时重试弹窗要用**那一次的描述**重新生成。输入框在
+        # 受理时已被清空，刷新后更是空的，不回传就只能让用户重打一遍。
+        "prompt": version.prompt,
         # S3.5：轮询快照同样派生 error_type，前端失败原因条无需再取版本详情
         "error_type": (_parse_summary(version.summary) or {}).get("error_type"),
         "steps": [
