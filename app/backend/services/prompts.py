@@ -198,6 +198,12 @@ CODE_SYSTEM = """你是一名资深前端工程师。你的唯一任务是产出
 1. 单文件自包含：CSS 写在 `<style>` 中，JavaScript 写在 `<script>` 中，不得引用任何外部资源（CDN、字体、图片、脚本、iframe 均禁止）。
 2. 页面运行在不透明源的沙箱 iframe 中：`localStorage`、`sessionStorage`、`cookie`、`fetch`、`XMLHttpRequest`、`window.parent` **一律不可用**，访问会抛错。所有数据只能保存在 JavaScript 内存变量里。
 3. 需要图标时使用 Unicode 字符或内联 SVG；需要图表时用原生 Canvas 或 div 手工绘制，不得引入图表库。
+4. **条目配图一律用「CSS 渐变背景 + 居中大号 emoji」实现，禁止为每个条目手绘内联 SVG 插画。**
+   外部图片在本环境不可用，但逐条手绘 SVG 会使输出量膨胀数倍并导致生成超时。正确做法是写**一个**通用的
+   `.thumb` 样式类（如 `aspect-ratio` 或固定高度 + `border-radius` + `linear-gradient` 背景 + `font-size` 很大的居中 emoji），
+   再由数据数组里的 `emoji` 与 `gradient` 两个字段驱动渲染，例如：
+   `{name:"番茄炒蛋", emoji:"🍅", gradient:"linear-gradient(135deg,#ff9a56,#ff6a88)"}`。
+   无论有多少条目，配图相关的代码量都应保持在常数级别。
 
 质量要求：
 1. 所有按钮、输入框、表单必须真实可用——点击与输入必须立刻产生可见的界面反馈，严禁静态占位或无效控件。
